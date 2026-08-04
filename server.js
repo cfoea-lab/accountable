@@ -7,8 +7,39 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const db = require('./db');
+const webpush = require('./webpush');
 
 const PORT = process.env.PORT || 3000;
+
+// VAPID identity for push notifications — generated once, kept in the database.
+let VAPID = null;
+async function ensureVapid() {
+  const row = await db.get('SELECT value FROM config WHERE key = ?', ['vapid']);
+  if (row) {
+    VAPID = JSON.parse(row.value);
+  } else {
+    const keys = webpush.generateVapidKeys();
+    VAPID = { ...keys, subject: 'mailto:cfo.ea@legionsupplements.com' };
+    await db.run('INSERT INTO config (key, value) VALUES (?, ?)', ['vapid', JSON.stringify(VAPID)]);
+  }
+}
+
+// Send a push to every device a user has enabled; prune dead subscriptions.
+async function notifyUser(userId, payload) {
+  try {
+    const subs = await db.all('SELECT * FROM push_subs WHERE user_id = ?', [userId]);
+    for (const sub of subs) {
+      try {
+        const status = await webpush.sendPush(sub, payload, VAPID);
+        if (status === 404 || status === 410) await db.run('DELETE FROM push_subs WHERE id = ?', [sub.id]);
+      } catch (err) {
+        console.error('push send failed:', err.message);
+      }
+    }
+  } catch (err) {
+    console.error('notifyUser failed:', err.message);
+  }
+}
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 const MIME = {
@@ -382,7 +413,34 @@ route('POST', /^\/api\/nudges$/, async (req, res) => {
   const b = await readBody(req);
   const info = await db.run('INSERT INTO nudges (from_user, to_user, reason, message, date) VALUES (?, ?, ?, ?, ?)',
     [num(b.fromUser), num(b.toUser), str(b.reason), str(b.message), isDate(b.date) ? b.date : today()]);
-  send(res, 201, await db.get('SELECT * FROM nudges WHERE id = ?', [info.lastInsertRowid]));
+  const nudge = await db.get('SELECT * FROM nudges WHERE id = ?', [info.lastInsertRowid]);
+  // Fire the push notification without delaying the response
+  db.get('SELECT name FROM users WHERE id = ?', [nudge.from_user]).then((from) =>
+    notifyUser(nudge.to_user, {
+      title: `${from ? from.name : 'Your partner'} nudged you`,
+      body: nudge.reason + (nudge.message ? ` — “${nudge.message}”` : ''),
+      url: '/',
+    })
+  ).catch(() => {});
+  send(res, 201, nudge);
+});
+
+// --- push notifications ---
+route('GET', /^\/api\/push\/pubkey$/, async (req, res) => send(res, 200, { key: VAPID.publicKey }));
+route('POST', /^\/api\/push\/subscribe$/, async (req, res) => {
+  const b = await readBody(req);
+  const s = b.subscription || {};
+  if (!s.endpoint || !s.keys || !s.keys.p256dh || !s.keys.auth) return send(res, 400, { error: 'Invalid subscription' });
+  await db.run(
+    `INSERT INTO push_subs (user_id, endpoint, p256dh, auth) VALUES (?, ?, ?, ?)
+     ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, p256dh = excluded.p256dh, auth = excluded.auth`,
+    [num(b.userId), s.endpoint.slice(0, 1000), s.keys.p256dh, s.keys.auth]);
+  send(res, 201, { ok: true });
+});
+route('POST', /^\/api\/push\/unsubscribe$/, async (req, res) => {
+  const b = await readBody(req);
+  await db.run('DELETE FROM push_subs WHERE endpoint = ?', [str(b.endpoint, '').slice(0, 1000)]);
+  send(res, 200, { ok: true });
 });
 route('POST', /^\/api\/nudges\/(\d+)\/seen$/, async (req, res, q, m) => {
   await db.run('UPDATE nudges SET seen = 1 WHERE id = ?', [num(m[1])]);
@@ -440,7 +498,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-db.init().then(() => {
+db.init().then(ensureVapid).then(() => {
   server.listen(PORT, () => console.log(`Accountable running → http://localhost:${PORT}`));
 }).catch((err) => {
   console.error('Storage init failed:', err.message);
