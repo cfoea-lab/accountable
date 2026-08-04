@@ -83,6 +83,32 @@ function openSheet(build) {
   return close;
 }
 
+/* ---------------- push notifications ---------------- */
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+
+function urlB64ToUint8(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  const arr = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) arr[i] = raw.charCodeAt(i);
+  return arr;
+}
+
+async function enablePush() {
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { toast('Notifications not allowed'); render(); return; }
+    const reg = await navigator.serviceWorker.ready;
+    const { key } = await api('/api/push/pubkey');
+    const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlB64ToUint8(key) });
+    await api('/api/push/subscribe', { method: 'POST', body: { userId: state.me, subscription: sub.toJSON() } });
+    toast(`This device will get ${USERS[state.me]}'s nudges`);
+    render();
+  } catch (err) {
+    toast('Could not enable notifications');
+  }
+}
+
 /* ---------------- photo picker ---------------- */
 function photoField(existingUrl) {
   // Returns { el, getData: () => dataUrl|null, removed: () => bool }
@@ -211,6 +237,18 @@ async function renderToday(main) {
         h('div', { class: 'sub' }, fmtDate(n.date, { month: 'short', day: 'numeric' })),
       ),
       h('button', { class: 'btn small', onClick: async () => { await api(`/api/nudges/${n.id}/seen`, { method: 'POST' }); render(); } }, 'Got it'),
+    ));
+  }
+
+  // Offer push notifications (shows inside the installed app when not yet enabled)
+  if (pushSupported() && Notification.permission === 'default' && !localStorage.getItem('acc.pushDismissed')) {
+    main.append(h('div', { class: 'nudge-banner' },
+      h('div', { class: 'nb-body' },
+        h('b', {}, 'Get pinged on this phone '),
+        `when ${partnerU.name} nudges you.`,
+      ),
+      h('button', { class: 'btn small primary', onClick: enablePush }, 'Turn on'),
+      h('button', { class: 'btn small ghost', onClick: () => { localStorage.setItem('acc.pushDismissed', '1'); render(); } }, 'Later'),
     ));
   }
 
