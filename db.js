@@ -167,6 +167,16 @@ const SCHEMA = [
     mime TEXT NOT NULL,
     data TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS push_subs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS config (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL)`,
 ];
 
 async function init() {
