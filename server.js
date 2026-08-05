@@ -267,9 +267,10 @@ route('POST', /^\/api\/meals$/, async (req, res) => {
   if (!isDate(b.date)) return send(res, 400, { error: 'date required (YYYY-MM-DD)' });
   const photo = await savePhoto(b.photoData);
   const info = await db.run(
-    `INSERT INTO meals (user_id, date, time, type, name, calories, protein, carbs, fat, notes, photo)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    [num(b.userId), b.date, str(b.time), str(b.type, 'meal'), str(b.name), num(b.calories), num(b.protein), num(b.carbs), num(b.fat), str(b.notes), photo]);
+    `INSERT INTO meals (user_id, date, time, type, name, calories, protein, carbs, fat, notes, photo, food_id, grams)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [num(b.userId), b.date, str(b.time), str(b.type, 'meal'), str(b.name), num(b.calories), num(b.protein), num(b.carbs), num(b.fat), str(b.notes), photo,
+     num(b.foodId) || null, num(b.grams) || null]);
   send(res, 201, await db.get('SELECT * FROM meals WHERE id = ?', [info.lastInsertRowid]));
 });
 
@@ -282,10 +283,10 @@ route('PUT', /^\/api\/meals\/(\d+)$/, async (req, res, q, m) => {
   if (b.photoData) { await deletePhoto(existing.photo); photo = await savePhoto(b.photoData); }
   else if (b.removePhoto) { await deletePhoto(existing.photo); photo = ''; }
   await db.run(
-    'UPDATE meals SET date=?, time=?, type=?, name=?, calories=?, protein=?, carbs=?, fat=?, notes=?, photo=? WHERE id=?',
+    'UPDATE meals SET date=?, time=?, type=?, name=?, calories=?, protein=?, carbs=?, fat=?, notes=?, photo=?, food_id=?, grams=? WHERE id=?',
     [isDate(b.date) ? b.date : existing.date, str(b.time, existing.time), str(b.type, existing.type), str(b.name, existing.name),
      num(b.calories, existing.calories), num(b.protein, existing.protein), num(b.carbs, existing.carbs), num(b.fat, existing.fat),
-     str(b.notes, existing.notes), photo, id]);
+     str(b.notes, existing.notes), photo, num(b.foodId, existing.food_id) || null, num(b.grams, existing.grams) || null, id]);
   send(res, 200, await db.get('SELECT * FROM meals WHERE id = ?', [id]));
 });
 
@@ -319,8 +320,8 @@ async function writeExercises(workoutId, exercises) {
     const info = await db.run('INSERT INTO exercises (workout_id, name, position) VALUES (?, ?, ?)', [workoutId, name, i++]);
     let j = 0;
     for (const s of Array.isArray(ex.sets) ? ex.sets : []) {
-      await db.run('INSERT INTO sets (exercise_id, reps, weight, position) VALUES (?, ?, ?, ?)',
-        [info.lastInsertRowid, num(s.reps), num(s.weight), j++]);
+      await db.run('INSERT INTO sets (exercise_id, reps, weight, position, set_type) VALUES (?, ?, ?, ?, ?)',
+        [info.lastInsertRowid, num(s.reps), num(s.weight), j++, ['warmup', 'failure', 'drop'].includes(s.type) ? s.type : 'normal']);
     }
   }
 }
@@ -447,6 +448,173 @@ route('POST', /^\/api\/nudges\/(\d+)\/seen$/, async (req, res, q, m) => {
   send(res, 200, { ok: true });
 });
 
+// --- food database & search ---
+route('GET', /^\/api\/foods$/, async (req, res, q) => {
+  const userId = num(q.get('user'));
+  const query = str(q.get('q'), '').trim().toLowerCase();
+  if (!query) {
+    const [myFoods, recents] = await Promise.all([
+      db.all('SELECT * FROM user_foods WHERE user_id = ? ORDER BY id DESC LIMIT 15', [userId]),
+      db.all(
+        `SELECT name, MAX(food_id) AS food_id, MAX(grams) AS grams, MAX(calories) AS calories,
+                MAX(protein) AS protein, MAX(carbs) AS carbs, MAX(fat) AS fat, MAX(id) AS mid
+         FROM meals WHERE user_id = ? AND name != '' GROUP BY lower(name) ORDER BY mid DESC LIMIT 10`, [userId]),
+    ]);
+    return send(res, 200, { myFoods, recents });
+  }
+  const like = `%${query}%`;
+  const prefix = `${query}%`;
+  const [mine, foods] = await Promise.all([
+    db.all(`SELECT * FROM user_foods WHERE user_id = ? AND lower(name) LIKE ? ORDER BY length(name) LIMIT 6`, [userId, like]),
+    db.all(
+      `SELECT * FROM foods WHERE lower(name) LIKE ?
+       ORDER BY CASE WHEN lower(name) LIKE ? THEN 0 ELSE 1 END, length(name) LIMIT 25`, [like, prefix]),
+  ]);
+  send(res, 200, { mine, foods });
+});
+
+route('POST', /^\/api\/user-foods$/, async (req, res) => {
+  const b = await readBody(req);
+  if (!str(b.name).trim()) return send(res, 400, { error: 'name required' });
+  await db.run(
+    `INSERT INTO user_foods (user_id, name, kcal, protein, carbs, fat, portion_name, portion_grams)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [num(b.userId), str(b.name).trim().slice(0, 80), num(b.kcal), num(b.protein), num(b.carbs), num(b.fat),
+     str(b.portionName) || null, num(b.portionGrams) || null]);
+  send(res, 201, { ok: true });
+});
+route('DELETE', /^\/api\/user-foods\/(\d+)$/, async (req, res, q, m) => {
+  await db.run('DELETE FROM user_foods WHERE id = ?', [num(m[1])]);
+  send(res, 200, { ok: true });
+});
+
+// --- AI nutrition estimate (Gemini proxy — key stays server-side) ---
+route('POST', /^\/api\/ai\/estimate$/, async (req, res) => {
+  if (!process.env.GEMINI_API_KEY) return send(res, 400, { error: 'AI is not configured' });
+  const b = await readBody(req);
+  const parts = [];
+  if (str(b.text).trim()) parts.push({ text: 'Meal description: ' + str(b.text).trim() });
+  if (b.photoData) {
+    const m = /^data:image\/(png|jpe?g|webp);base64,(.+)$/.exec(b.photoData);
+    if (m) parts.push({ inline_data: { mime_type: `image/${m[1] === 'jpg' ? 'jpeg' : m[1]}`, data: m[2] } });
+  }
+  if (!parts.length) return send(res, 400, { error: 'Describe the meal or attach a photo' });
+  const base = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com';
+  const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+  const r = await fetch(`${base}/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [{ parts }],
+      systemInstruction: { parts: [{ text:
+        'You are a nutrition estimator for a fitness app. Estimate the nutrition of the described or photographed meal as one combined entry, for the whole portion as eaten. Reply ONLY with JSON: {"name": string (short meal name, max 40 chars), "calories": integer, "protein": integer grams, "carbs": integer grams, "fat": integer grams, "confidence": "low"|"medium"|"high"}. If a photo is given, estimate portion size from visual cues. If both text and photo are given, the text takes priority for portions.' }] },
+      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+    }),
+  });
+  if (!r.ok) return send(res, 502, { error: `AI request failed (${r.status})` });
+  const j = await r.json();
+  let out;
+  try { out = JSON.parse(j.candidates[0].content.parts[0].text); }
+  catch { return send(res, 502, { error: 'AI returned an unexpected format' }); }
+  send(res, 200, {
+    name: str(out.name).slice(0, 60), calories: num(out.calories), protein: num(out.protein),
+    carbs: num(out.carbs), fat: num(out.fat), confidence: str(out.confidence, 'medium'),
+  });
+});
+
+// --- exercise library ---
+route('GET', /^\/api\/exercise-lib$/, async (req, res, q) => {
+  const query = str(q.get('q'), '').trim().toLowerCase();
+  const muscle = str(q.get('muscle'), '').trim().toLowerCase();
+  let rows;
+  if (query) {
+    rows = await db.all(
+      `SELECT * FROM exercise_lib WHERE lower(name) LIKE ? ${muscle ? 'AND muscle = ?' : ''}
+       ORDER BY CASE WHEN lower(name) LIKE ? THEN 0 ELSE 1 END, name LIMIT 30`,
+      muscle ? [`%${query}%`, muscle, `${query}%`] : [`%${query}%`, `${query}%`]);
+  } else if (muscle) {
+    rows = await db.all('SELECT * FROM exercise_lib WHERE muscle = ? ORDER BY name', [muscle]);
+  } else {
+    rows = await db.all('SELECT * FROM exercise_lib ORDER BY name');
+  }
+  send(res, 200, rows);
+});
+
+// --- "last time" memory + PR for an exercise ---
+route('GET', /^\/api\/exercise-last$/, async (req, res, q) => {
+  const userId = num(q.get('user'));
+  const name = str(q.get('name'), '').trim();
+  if (!name) return send(res, 400, { error: 'name required' });
+  const lastEx = await db.get(
+    `SELECT e.id, w.date FROM exercises e JOIN workouts w ON w.id = e.workout_id
+     WHERE w.user_id = ? AND e.name = ? ORDER BY w.date DESC, w.id DESC LIMIT 1`, [userId, name]);
+  const lastSets = lastEx
+    ? await db.all('SELECT reps, weight, set_type FROM sets WHERE exercise_id = ? ORDER BY position, id', [lastEx.id])
+    : [];
+  const pr = await db.get(
+    `SELECT MAX(s.weight) AS max_weight, MAX(s.weight * (1 + s.reps / 30.0)) AS best_1rm
+     FROM sets s JOIN exercises e ON e.id = s.exercise_id JOIN workouts w ON w.id = e.workout_id
+     WHERE w.user_id = ? AND e.name = ? AND s.reps > 0`, [userId, name]);
+  send(res, 200, { lastDate: lastEx ? lastEx.date : null, lastSets, pr: pr || {} });
+});
+
+// --- per-exercise history (for charts) ---
+route('GET', /^\/api\/exercise-history$/, async (req, res, q) => {
+  const userId = num(q.get('user'));
+  const name = str(q.get('name'), '').trim();
+  const rows = await db.all(
+    `SELECT w.date, MAX(s.weight) AS top_weight, MAX(s.weight * (1 + s.reps / 30.0)) AS est_1rm,
+            SUM(s.weight * s.reps) AS volume
+     FROM sets s JOIN exercises e ON e.id = s.exercise_id JOIN workouts w ON w.id = e.workout_id
+     WHERE w.user_id = ? AND e.name = ? AND s.reps > 0
+     GROUP BY w.date, w.id ORDER BY w.date`, [userId, name]);
+  const names = await db.all(
+    `SELECT e.name, COUNT(*) AS n FROM exercises e JOIN workouts w ON w.id = e.workout_id
+     WHERE w.user_id = ? GROUP BY e.name ORDER BY n DESC LIMIT 40`, [userId]);
+  send(res, 200, { history: rows, exercises: names.map((r) => r.name) });
+});
+
+// --- muscle-group volume split ---
+route('GET', /^\/api\/muscle-split$/, async (req, res, q) => {
+  const userId = num(q.get('user'));
+  const days = Math.min(Math.max(num(q.get('days'), 30), 7), 365);
+  const from = addDays(today(), -(days - 1));
+  const rows = await db.all(
+    `SELECT COALESCE(l.muscle, 'other') AS muscle, COUNT(s.id) AS sets
+     FROM sets s JOIN exercises e ON e.id = s.exercise_id JOIN workouts w ON w.id = e.workout_id
+     LEFT JOIN exercise_lib l ON l.name = e.name
+     WHERE w.user_id = ? AND w.date >= ? GROUP BY COALESCE(l.muscle, 'other') ORDER BY sets DESC`, [userId, from]);
+  send(res, 200, rows);
+});
+
+// --- routines (workout templates) ---
+route('GET', /^\/api\/routines$/, async (req, res, q) => {
+  const userId = num(q.get('user'));
+  const routines = await db.all('SELECT * FROM routines WHERE user_id = ? ORDER BY id', [userId]);
+  const ids = routines.map((r) => r.id);
+  const items = ids.length
+    ? await db.all(`SELECT * FROM routine_items WHERE routine_id IN (${placeholders(ids)}) ORDER BY position, id`, ids)
+    : [];
+  send(res, 200, routines.map((r) => ({ ...r, items: items.filter((i) => i.routine_id === r.id) })));
+});
+route('POST', /^\/api\/routines$/, async (req, res) => {
+  const b = await readBody(req);
+  if (!str(b.title).trim()) return send(res, 400, { error: 'title required' });
+  const info = await db.run('INSERT INTO routines (user_id, title) VALUES (?, ?)', [num(b.userId), str(b.title).trim().slice(0, 60)]);
+  let i = 0;
+  for (const item of Array.isArray(b.items) ? b.items : []) {
+    if (!str(item.exercise).trim()) continue;
+    await db.run('INSERT INTO routine_items (routine_id, exercise, sets, position) VALUES (?, ?, ?, ?)',
+      [info.lastInsertRowid, str(item.exercise).trim(), Math.max(1, num(item.sets, 3)), i++]);
+  }
+  send(res, 201, { id: info.lastInsertRowid });
+});
+route('DELETE', /^\/api\/routines\/(\d+)$/, async (req, res, q, m) => {
+  await db.run('DELETE FROM routine_items WHERE routine_id = ?', [num(m[1])]);
+  await db.run('DELETE FROM routines WHERE id = ?', [num(m[1])]);
+  send(res, 200, { ok: true });
+});
+
 // --- progress ---
 route('GET', /^\/api\/progress$/, async (req, res, q) => {
   const userId = num(q.get('user'));
@@ -457,7 +625,7 @@ route('GET', /^\/api\/progress$/, async (req, res, q) => {
 
 // --- users / health ---
 route('GET', /^\/api\/users$/, async (req, res) => send(res, 200, await db.all('SELECT * FROM users ORDER BY id')));
-route('GET', /^\/api\/health$/, async (req, res) => send(res, 200, { ok: true, driver: db.driverName }));
+route('GET', /^\/api\/health$/, async (req, res) => send(res, 200, { ok: true, driver: db.driverName, ai: !!process.env.GEMINI_API_KEY }));
 
 /* ---------- server ---------- */
 const server = http.createServer(async (req, res) => {

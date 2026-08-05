@@ -177,14 +177,87 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL)`,
+  `CREATE TABLE IF NOT EXISTS foods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    kcal REAL NOT NULL,
+    protein REAL NOT NULL,
+    carbs REAL NOT NULL,
+    fat REAL NOT NULL,
+    portion_name TEXT,
+    portion_grams REAL)`,
+  `CREATE TABLE IF NOT EXISTS user_foods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    kcal REAL NOT NULL,
+    protein REAL NOT NULL,
+    carbs REAL NOT NULL,
+    fat REAL NOT NULL,
+    portion_name TEXT,
+    portion_grams REAL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS exercise_lib (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE,
+    muscle TEXT NOT NULL,
+    equipment TEXT NOT NULL DEFAULT '')`,
+  `CREATE TABLE IF NOT EXISTS routines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')))`,
+  `CREATE TABLE IF NOT EXISTS routine_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    routine_id INTEGER NOT NULL,
+    exercise TEXT NOT NULL,
+    sets INTEGER NOT NULL DEFAULT 3,
+    position INTEGER NOT NULL DEFAULT 0)`,
 ];
+
+// Additive column migrations for older databases (ignore "duplicate column" errors)
+const MIGRATIONS = [
+  `ALTER TABLE meals ADD COLUMN food_id INTEGER`,
+  `ALTER TABLE meals ADD COLUMN grams REAL`,
+  `ALTER TABLE sets ADD COLUMN set_type TEXT NOT NULL DEFAULT 'normal'`,
+];
+
+// Bulk-insert helper: multi-row VALUES in chunks (keeps Turso round trips low)
+async function bulkInsert(table, cols, rows, chunk = 40) {
+  for (let i = 0; i < rows.length; i += chunk) {
+    const slice = rows.slice(i, i + chunk);
+    const tuple = `(${cols.map(() => '?').join(',')})`;
+    const sql = `INSERT INTO ${table} (${cols.join(',')}) VALUES ${slice.map(() => tuple).join(',')}`;
+    await run(sql, slice.flat());
+  }
+}
+
+async function seedLibraries() {
+  const foodCount = (await get('SELECT COUNT(*) AS n FROM foods')).n;
+  if (foodCount === 0) {
+    const foods = require('./seed-foods');
+    await bulkInsert('foods', ['name', 'kcal', 'protein', 'carbs', 'fat', 'portion_name', 'portion_grams'],
+      foods.map((f) => [f[0], f[1], f[2], f[3], f[4], f[5] || null, f[6] || null]));
+    console.log(`Seeded ${foods.length} foods`);
+  }
+  const exCount = (await get('SELECT COUNT(*) AS n FROM exercise_lib')).n;
+  if (exCount === 0) {
+    const exercises = require('./seed-exercises');
+    await bulkInsert('exercise_lib', ['name', 'muscle', 'equipment'], exercises);
+    console.log(`Seeded ${exercises.length} exercises`);
+  }
+}
 
 async function init() {
   for (const sql of SCHEMA) await run(sql);
+  for (const sql of MIGRATIONS) {
+    try { await run(sql); } catch (err) { /* column already exists — fine */ }
+  }
   await run(`INSERT OR IGNORE INTO users (id, name) VALUES (1, 'Logan')`);
   await run(`INSERT OR IGNORE INTO users (id, name) VALUES (2, 'Reiner')`);
   await run(`INSERT OR IGNORE INTO goals (user_id) VALUES (1)`);
   await run(`INSERT OR IGNORE INTO goals (user_id) VALUES (2)`);
+  await seedLibraries();
   console.log(`Storage ready (driver: ${driver.name})`);
 }
 
