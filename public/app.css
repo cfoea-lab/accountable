@@ -302,3 +302,54 @@ img { display: block; max-width: 100%; }
 
 .section-title { font-size: 0.82rem; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: var(--ink-55); margin: 20px 0 10px; }
 a { color: var(--accent); }
+
+/* ---------- food search ---------- */
+.fs-results {
+  border: 1px solid var(--ink-12); border-radius: var(--radius-sm); background: var(--surface);
+  max-height: 240px; overflow-y: auto; margin-top: 6px;
+}
+.fs-row {
+  display: flex; justify-content: space-between; align-items: baseline; gap: 10px;
+  padding: 10px 12px; border-bottom: 1px solid var(--ink-08); cursor: pointer; font-size: 0.88rem;
+}
+.fs-row:last-child { border-bottom: none; }
+.fs-row:active { background: var(--ink-04); }
+.fs-row .fs-tag { font-size: 0.7rem; color: var(--ink-55); flex: none; }
+.grams-row { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.grams-row input { width: 96px; padding: 9px 10px; border: 1px solid var(--ink-12); border-radius: 8px; text-align: center; font-weight: 700; }
+.ai-note { font-size: 0.76rem; color: var(--ink-55); margin-top: 5px; }
+
+/* ---------- exercise picker ---------- */
+.ex-results { border: 1px solid var(--ink-12); border-radius: 8px; background: var(--surface); max-height: 200px; overflow-y: auto; margin: 4px 0 6px; }
+.ghost-line { font-size: 0.76rem; color: var(--ink-55); margin: 2px 0 6px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.set-grid .st { text-align: center; font-weight: 700; color: var(--ink-55); font-size: 0.8rem; border: 1px dashed transparent; border-radius: 6px; padding: 4px 0; }
+.set-grid .st.special { color: var(--ink); border-color: var(--ink-12); }
+
+/* ---------- live workout ---------- */
+.live-top { position: sticky; top: 0; background: var(--paper); z-index: 5; padding: 4px 0 8px; }
+.live-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.live-clock { font-size: 1.3rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.rest-bar {
+  display: none; align-items: center; gap: 10px; margin-top: 8px;
+  background: var(--ink); color: var(--paper); border-radius: var(--radius-sm); padding: 10px 14px;
+}
+.rest-bar.on { display: flex; }
+.rest-bar .rest-count { font-size: 1.2rem; font-weight: 800; font-variant-numeric: tabular-nums; }
+.rest-bar .btn { background: rgba(255,255,255,0.15); border: none; color: var(--paper); }
+.set-grid .done-btn {
+  width: 100%; padding: 6px 0; border: 1px solid var(--ink-12); border-radius: 7px;
+  color: var(--ink-35); font-weight: 800;
+}
+.set-grid .done-btn.done { background: var(--accent); color: #fff; border-color: var(--accent); }
+.set-grid input:disabled { opacity: 0.6; background: var(--ink-04); }
+.chip-row { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* ---------- muscle split ---------- */
+.ms-row { display: grid; grid-template-columns: 90px 1fr 40px; gap: 10px; align-items: center; padding: 4px 0; font-size: 0.82rem; }
+.ms-row .ms-bar { height: 10px; border-radius: 5px; background: var(--ink-08); overflow: hidden; }
+.ms-row .ms-bar > i { display: block; height: 100%; background: #8a8a8a; border-radius: 5px; }
+.ms-row .ms-n { text-align: right; font-weight: 700; font-variant-numeric: tabular-nums; }
+select.plain {
+  width: 100%; padding: 10px 12px; border: 1px solid var(--ink-12); border-radius: var(--radius-sm);
+  background: var(--surface); font: inherit; color: var(--ink);
+}
