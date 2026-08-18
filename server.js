@@ -26,12 +26,18 @@ async function ensureVapid() {
 
 // Send a push to every device a user has enabled; prune dead subscriptions.
 async function notifyUser(userId, payload) {
+  // Returns how many devices actually accepted the push. Worth surfacing: when
+  // testing on the live server, "pushed: 2, delivered: 0" tells you the recap ran
+  // fine and nobody has notifications enabled — a very different problem from the
+  // recap failing to generate.
+  let delivered = 0;
   try {
     const subs = await db.all('SELECT * FROM push_subs WHERE user_id = ?', [userId]);
     for (const sub of subs) {
       try {
         const status = await webpush.sendPush(sub, payload, VAPID);
         if (status === 404 || status === 410) await db.run('DELETE FROM push_subs WHERE id = ?', [sub.id]);
+        else if (status >= 200 && status < 300) delivered++;
       } catch (err) {
         console.error('push send failed:', err.message);
       }
@@ -39,6 +45,7 @@ async function notifyUser(userId, payload) {
   } catch (err) {
     console.error('notifyUser failed:', err.message);
   }
+  return delivered;
 }
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
@@ -99,7 +106,25 @@ async function deletePhoto(name) {
 const isDate = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
 const num = (v, d = 0) => (Number.isFinite(Number(v)) ? Number(v) : d);
 const str = (v, d = '') => (typeof v === 'string' ? v.slice(0, 2000) : d);
-const today = () => new Date().toISOString().slice(0, 10);
+// Canonical app timezone. Everything (day boundaries, week boundaries, the weekly
+// recap schedule) is anchored here so the server and every device agree regardless
+// of where the phone happens to be. America/New_York handles the EST/EDT switch;
+// pinning a literal UTC-5 would drift by an hour for half the year.
+const APP_TZ = 'America/New_York';
+const _tzDate = new Intl.DateTimeFormat('en-CA', { timeZone: APP_TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
+const _tzTime = new Intl.DateTimeFormat('en-GB', { timeZone: APP_TZ, hour: '2-digit', minute: '2-digit', hour12: false });
+const _tzWeekday = new Intl.DateTimeFormat('en-US', { timeZone: APP_TZ, weekday: 'short' });
+const today = () => _tzDate.format(new Date());
+const nowTimeTZ = () => _tzTime.format(new Date());
+// 0 = Monday … 6 = Sunday, in app timezone
+const WD = { Mon: 0, Tue: 1, Wed: 2, Thu: 3, Fri: 4, Sat: 5, Sun: 6 };
+const weekdayIdx = (d = new Date()) => WD[_tzWeekday.format(d)];
+// Monday of the week containing dateStr
+const mondayOf = (dateStr) => {
+  const d = new Date(dateStr + 'T12:00:00Z');
+  const dow = (d.getUTCDay() + 6) % 7;
+  return addDays(dateStr, -dow);
+};
 
 function addDays(dateStr, n) {
   const d = new Date(dateStr + 'T12:00:00Z');
@@ -249,6 +274,71 @@ route('GET', /^\/api\/summary$/, async (req, res, q) => {
 });
 
 // --- meals ---
+/* ---------- meal ingredients ----------
+   A meal can be a list of ingredients. The meal's own macro columns remain the
+   single source of truth for every existing query, chart and streak calculation —
+   when items are present we simply recompute those columns as the sum. Meals
+   logged before this feature have no items and behave exactly as they always did. */
+
+const round1s = (n) => Math.round((Number(n) || 0) * 10) / 10;
+
+/* Cooked/raw conversion.
+   A food row stores macros per 100 g in ONE state (its `state` column), and
+   `yield_factor` is how many grams of cooked food you get per gram raw — under 1
+   for meat, which loses water, over 1 for grains and legumes, which absorb it.
+   If the user weighed their food in the other state, convert their grams onto the
+   food's own scale before doing macro maths. When we don't know the food's state,
+   we return the weight untouched rather than guessing. */
+function convertGrams(grams, enteredState, food) {
+  const g = Number(grams) || 0;
+  if (!food || !food.yield_factor || food.state === 'na') return g;
+  if (!['raw', 'cooked'].includes(enteredState) || enteredState === food.state) return g;
+  return food.state === 'raw' ? g / food.yield_factor : g * food.yield_factor;
+}
+
+// Attach items to a list of meals in one query (no N+1).
+async function withItems(meals) {
+  if (!meals.length) return meals;
+  const ids = meals.map((m) => m.id);
+  const items = await db.all(
+    `SELECT * FROM meal_items WHERE meal_id IN (${placeholders(ids)}) ORDER BY meal_id, sort, id`, ids);
+  const byMeal = new Map();
+  for (const it of items) {
+    if (!byMeal.has(it.meal_id)) byMeal.set(it.meal_id, []);
+    byMeal.get(it.meal_id).push(it);
+  }
+  return meals.map((m) => ({ ...m, items: byMeal.get(m.id) || [] }));
+}
+
+// Replace a meal's ingredient rows and return the summed macros.
+async function writeItems(mealId, items) {
+  await db.run('DELETE FROM meal_items WHERE meal_id = ?', [mealId]);
+  const list = Array.isArray(items) ? items.filter((i) => i && (str(i.name).trim() || num(i.calories))) : [];
+  const total = { calories: 0, protein: 0, carbs: 0, fat: 0 };
+  let i = 0;
+  for (const it of list) {
+    const row = {
+      calories: num(it.calories), protein: num(it.protein), carbs: num(it.carbs), fat: num(it.fat),
+    };
+    await db.run(
+      `INSERT INTO meal_items (meal_id, food_id, name, grams, entered_qty, entered_unit, state,
+                               calories, protein, carbs, fat, source, sort)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [mealId, num(it.foodId) || null, str(it.name).trim(), num(it.grams),
+       it.enteredQty == null ? null : num(it.enteredQty), str(it.enteredUnit, 'g'),
+       ['raw', 'cooked'].includes(it.state) ? it.state : 'na',
+       row.calories, row.protein, row.carbs, row.fat,
+       ['db', 'ai', 'manual', 'mine'].includes(it.source) ? it.source : 'manual', i++]);
+    total.calories += row.calories; total.protein += row.protein;
+    total.carbs += row.carbs; total.fat += row.fat;
+  }
+  return {
+    count: list.length,
+    calories: Math.round(total.calories),
+    protein: round1s(total.protein), carbs: round1s(total.carbs), fat: round1s(total.fat),
+  };
+}
+
 route('GET', /^\/api\/meals$/, async (req, res, q) => {
   const userId = num(q.get('user'));
   const from = q.get('from'), to = q.get('to');
@@ -259,7 +349,7 @@ route('GET', /^\/api\/meals$/, async (req, res, q) => {
     const date = isDate(q.get('date')) ? q.get('date') : today();
     rows = await db.all('SELECT * FROM meals WHERE user_id = ? AND date = ? ORDER BY time, id', [userId, date]);
   }
-  send(res, 200, rows);
+  send(res, 200, await withItems(rows));
 });
 
 route('POST', /^\/api\/meals$/, async (req, res) => {
@@ -271,7 +361,18 @@ route('POST', /^\/api\/meals$/, async (req, res) => {
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [num(b.userId), b.date, str(b.time), str(b.type, 'meal'), str(b.name), num(b.calories), num(b.protein), num(b.carbs), num(b.fat), str(b.notes), photo,
      num(b.foodId) || null, num(b.grams) || null]);
-  send(res, 201, await db.get('SELECT * FROM meals WHERE id = ?', [info.lastInsertRowid]));
+  const id = info.lastInsertRowid;
+  if (Array.isArray(b.items)) {
+    const t = await writeItems(id, b.items);
+    // Ingredient rows win over any totals the client sent, unless the user has
+    // explicitly overridden the total (b.overrideTotals).
+    if (t.count && !b.overrideTotals) {
+      await db.run('UPDATE meals SET calories=?, protein=?, carbs=?, fat=? WHERE id=?',
+        [t.calories, t.protein, t.carbs, t.fat, id]);
+    }
+  }
+  const [meal] = await withItems([await db.get('SELECT * FROM meals WHERE id = ?', [id])]);
+  send(res, 201, meal);
 });
 
 route('PUT', /^\/api\/meals\/(\d+)$/, async (req, res, q, m) => {
@@ -287,13 +388,22 @@ route('PUT', /^\/api\/meals\/(\d+)$/, async (req, res, q, m) => {
     [isDate(b.date) ? b.date : existing.date, str(b.time, existing.time), str(b.type, existing.type), str(b.name, existing.name),
      num(b.calories, existing.calories), num(b.protein, existing.protein), num(b.carbs, existing.carbs), num(b.fat, existing.fat),
      str(b.notes, existing.notes), photo, num(b.foodId, existing.food_id) || null, num(b.grams, existing.grams) || null, id]);
-  send(res, 200, await db.get('SELECT * FROM meals WHERE id = ?', [id]));
+  if (Array.isArray(b.items)) {
+    const t = await writeItems(id, b.items);
+    if (t.count && !b.overrideTotals) {
+      await db.run('UPDATE meals SET calories=?, protein=?, carbs=?, fat=? WHERE id=?',
+        [t.calories, t.protein, t.carbs, t.fat, id]);
+    }
+  }
+  const [meal] = await withItems([await db.get('SELECT * FROM meals WHERE id = ?', [id])]);
+  send(res, 200, meal);
 });
 
 route('DELETE', /^\/api\/meals\/(\d+)$/, async (req, res, q, m) => {
   const existing = await db.get('SELECT * FROM meals WHERE id = ?', [num(m[1])]);
   if (!existing) return send(res, 404, { error: 'Not found' });
   await deletePhoto(existing.photo);
+  await db.run('DELETE FROM meal_items WHERE meal_id = ?', [existing.id]);
   await db.run('DELETE FROM meals WHERE id = ?', [existing.id]);
   send(res, 200, { ok: true });
 });
@@ -489,6 +599,51 @@ route('DELETE', /^\/api\/user-foods\/(\d+)$/, async (req, res, q, m) => {
 });
 
 // --- AI nutrition estimate (Gemini proxy — key stays server-side) ---
+/* Returns an ingredient BREAKDOWN rather than one opaque blob, so every number is
+   inspectable and editable. Each ingredient is then matched against our own foods
+   table: where we have real data we use it and recompute from grams, and the model's
+   guess is only kept for ingredients we don't have. Real data beats a language
+   model's recollection of nutrition labels, and it costs nothing extra. */
+
+const AI_SYSTEM = [
+  'You are a nutrition estimator for a fitness app.',
+  'Break the described or photographed meal into its individual ingredients.',
+  'For each ingredient give the edible weight in grams for the portion actually eaten,',
+  'and whether that weight is the raw or the cooked weight ("raw", "cooked", or "na"',
+  'if the distinction is meaningless, e.g. for fruit or a drink).',
+  'Use plain generic ingredient names (e.g. "white rice", "chicken breast", "olive oil")',
+  'so they can be matched against a food database. Include cooking oil and sauces',
+  'when they are likely present, since they carry real calories.',
+  'Reply ONLY with JSON of the form:',
+  '{"name": string (short meal name, max 40 chars),',
+  ' "ingredients": [{"name": string, "grams": number, "state": "raw"|"cooked"|"na",',
+  '   "calories": number, "protein": number, "carbs": number, "fat": number}],',
+  ' "confidence": "low"|"medium"|"high"}',
+  'Macros are for that ingredient at that weight, in grams.',
+  'If a photo is given, estimate portion sizes from visual cues.',
+  'If both text and photo are given, the text takes priority for portions.',
+].join(' ');
+
+// Find the best foods-table match for a loose ingredient name.
+async function matchFood(rawName) {
+  const name = str(rawName).trim().toLowerCase();
+  if (!name) return null;
+  const exact = await db.get('SELECT * FROM foods WHERE lower(name) = ? LIMIT 1', [name]);
+  if (exact) return exact;
+  // Prefer a name that starts with the term, then the shortest containing match —
+  // "rice" should land on "White rice, cooked", not "Rice cake with peanut butter".
+  const hit = await db.get(
+    `SELECT * FROM foods WHERE lower(name) LIKE ?
+     ORDER BY CASE WHEN lower(name) LIKE ? THEN 0 ELSE 1 END, length(name) LIMIT 1`,
+    [`%${name}%`, `${name}%`]);
+  if (hit) return hit;
+  // Deliberately no looser fallback than this. An earlier version matched on any
+  // shared word, which mapped "unobtainium flakes" onto "Cereal, corn flakes" and
+  // silently logged the wrong food. Returning null is better: the ingredient keeps
+  // the model's own estimate, is labelled as an estimate in the UI, and stays editable.
+  return null;
+}
+
 route('POST', /^\/api\/ai\/estimate$/, async (req, res) => {
   if (!process.env.GEMINI_API_KEY) return send(res, 400, { error: 'AI is not configured' });
   const b = await readBody(req);
@@ -501,24 +656,65 @@ route('POST', /^\/api\/ai\/estimate$/, async (req, res) => {
   if (!parts.length) return send(res, 400, { error: 'Describe the meal or attach a photo' });
   const base = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com';
   const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-  const r = await fetch(`${base}/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts }],
-      systemInstruction: { parts: [{ text:
-        'You are a nutrition estimator for a fitness app. Estimate the nutrition of the described or photographed meal as one combined entry, for the whole portion as eaten. Reply ONLY with JSON: {"name": string (short meal name, max 40 chars), "calories": integer, "protein": integer grams, "carbs": integer grams, "fat": integer grams, "confidence": "low"|"medium"|"high"}. If a photo is given, estimate portion size from visual cues. If both text and photo are given, the text takes priority for portions.' }] },
-      generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
-    }),
-  });
+
+  let r;
+  try {
+    r = await fetch(`${base}/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts }],
+        systemInstruction: { parts: [{ text: AI_SYSTEM }] },
+        generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+      }),
+    });
+  } catch { return send(res, 502, { error: 'Could not reach the AI service' }); }
   if (!r.ok) return send(res, 502, { error: `AI request failed (${r.status})` });
   const j = await r.json();
   let out;
   try { out = JSON.parse(j.candidates[0].content.parts[0].text); }
   catch { return send(res, 502, { error: 'AI returned an unexpected format' }); }
+
+  const rawList = Array.isArray(out.ingredients) ? out.ingredients.slice(0, 20) : [];
+  const ingredients = [];
+  for (const ing of rawList) {
+    const grams = Math.max(0, num(ing.grams));
+    const state = ['raw', 'cooked'].includes(ing.state) ? ing.state : 'na';
+    const food = await matchFood(ing.name);
+    if (food && grams > 0) {
+      // We have this food for real — recompute from our per-100g data, converting
+      // between raw and cooked weight if the states differ and we know the yield.
+      const g = convertGrams(grams, state, food);
+      const k = g / 100;
+      ingredients.push({
+        name: food.name, foodId: food.id, grams: Math.round(grams), state,
+        calories: Math.round(food.kcal * k), protein: round1s(food.protein * k),
+        carbs: round1s(food.carbs * k), fat: round1s(food.fat * k),
+        source: 'db', matched: true,
+        foodState: food.state, yieldFactor: food.yield_factor,
+      });
+    } else {
+      ingredients.push({
+        name: str(ing.name).slice(0, 60) || 'Ingredient', foodId: null,
+        grams: Math.round(grams), state,
+        calories: Math.round(num(ing.calories)), protein: round1s(ing.protein),
+        carbs: round1s(ing.carbs), fat: round1s(ing.fat),
+        source: 'ai', matched: false,
+      });
+    }
+  }
+
+  const sum = (k) => ingredients.reduce((a, i) => a + num(i[k]), 0);
+  const totals = ingredients.length
+    ? { calories: Math.round(sum('calories')), protein: round1s(sum('protein')), carbs: round1s(sum('carbs')), fat: round1s(sum('fat')) }
+    : { calories: num(out.calories), protein: num(out.protein), carbs: num(out.carbs), fat: num(out.fat) };
+
   send(res, 200, {
-    name: str(out.name).slice(0, 60), calories: num(out.calories), protein: num(out.protein),
-    carbs: num(out.carbs), fat: num(out.fat), confidence: str(out.confidence, 'medium'),
+    name: str(out.name).slice(0, 60),
+    confidence: str(out.confidence, 'medium'),
+    ingredients,
+    matchedCount: ingredients.filter((i) => i.matched).length,
+    ...totals,
   });
 });
 
@@ -625,6 +821,325 @@ route('GET', /^\/api\/progress$/, async (req, res, q) => {
 
 // --- users / health ---
 route('GET', /^\/api\/users$/, async (req, res) => send(res, 200, await db.all('SELECT * FROM users ORDER BY id')));
+/* ---------------- weekly recap ----------------
+   Computed for a Monday–Sunday week in the app timezone. The recap is generated
+   once per user per week and stored, so the numbers a push mentions are exactly
+   the numbers the card shows, and re-opening the app doesn't silently change them.
+
+   Nothing here is scheduled inside the process: the Render free tier sleeps after
+   15 idle minutes, so an in-process timer would simply not fire on a Sunday night.
+   Generation is triggered two ways instead — an external ping (a free GitHub
+   Actions cron) and, as a backstop, lazily whenever the app is opened and last
+   week's recap is missing. Worst case the push is late; the card is never absent. */
+
+const PRIOR_WEEKS = 8; // history used for "best week" comparisons
+
+// Epley — same formula the Strength chart already uses, so numbers agree.
+const e1rm = (weight, reps) => (reps > 0 ? weight * (1 + reps / 30) : 0);
+
+async function buildRecap(userId, weekStart) {
+  const weekEnd = addDays(weekStart, 6);
+  const prevStart = addDays(weekStart, -7);
+  const prevEnd = addDays(weekStart, -1);
+
+  const [goals, user, mealDaily, prevMealDaily, workouts, restDays, weights, prevWeights, histStart] = await Promise.all([
+    getGoals(userId),
+    db.get('SELECT * FROM users WHERE id = ?', [userId]),
+    db.all(
+      `SELECT date, SUM(calories) AS calories, SUM(protein) AS protein, SUM(carbs) AS carbs,
+              SUM(fat) AS fat, COUNT(*) AS meals
+       FROM meals WHERE user_id = ? AND date >= ? AND date <= ? GROUP BY date ORDER BY date`,
+      [userId, weekStart, weekEnd]),
+    db.all(
+      `SELECT SUM(calories) AS calories, SUM(protein) AS protein, COUNT(DISTINCT date) AS days
+       FROM meals WHERE user_id = ? AND date >= ? AND date <= ?`, [userId, prevStart, prevEnd]),
+    db.all('SELECT * FROM workouts WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date', [userId, weekStart, weekEnd]),
+    db.all('SELECT date FROM rest_days WHERE user_id = ? AND date >= ? AND date <= ?', [userId, weekStart, weekEnd]),
+    db.all('SELECT date, kg FROM weights WHERE user_id = ? AND date >= ? AND date <= ? ORDER BY date', [userId, weekStart, weekEnd]),
+    db.all('SELECT date, kg FROM weights WHERE user_id = ? AND date < ? ORDER BY date DESC LIMIT 1', [userId, weekStart]),
+    Promise.resolve(addDays(weekStart, -7 * PRIOR_WEEKS)),
+  ]);
+
+  /* ---- days ---- */
+  const mealMap = new Map(mealDaily.map((r) => [r.date, r]));
+  const woDates = new Set(workouts.map((w) => w.date));
+  const restSet = new Set(restDays.map((r) => r.date));
+  const todayStr = today();
+  const days = [];
+  for (let d = weekStart; d <= weekEnd; d = addDays(d, 1)) {
+    const m = mealMap.get(d);
+    days.push({
+      date: d,
+      future: d > todayStr,
+      calories: m ? Math.round(m.calories) : 0,
+      protein: m ? round1s(m.protein) : 0,
+      carbs: m ? round1s(m.carbs) : 0,
+      fat: m ? round1s(m.fat) : 0,
+      meals: m ? m.meals : 0,
+      trained: woDates.has(d),
+      rest: restSet.has(d),
+      logged: !!(m && m.meals > 0),
+    });
+  }
+  const past = days.filter((d) => !d.future);
+  const loggedDays = past.filter((d) => d.logged);
+  const nLogged = loggedDays.length || 0;
+
+  /* ---- macros vs targets ----
+     Averages are over days actually logged, not over 7, so a week with three
+     untracked days isn't reported as if the person ate nothing on them. The
+     untracked count is reported separately and honestly. */
+  const avg = (k) => (nLogged ? loggedDays.reduce((a, d) => a + d[k], 0) / nLogged : 0);
+  const macros = ['calories', 'protein', 'carbs', 'fat'].map((k) => {
+    const target = k === 'calories' ? goals.calories : goals[k];
+    const average = avg(k);
+    const diff = average - target;
+    return {
+      key: k,
+      label: k === 'calories' ? 'Calories' : k[0].toUpperCase() + k.slice(1),
+      avg: k === 'calories' ? Math.round(average) : round1s(average),
+      target,
+      diff: k === 'calories' ? Math.round(diff) : round1s(diff),
+      pct: target ? Math.round((average / target) * 100) : 0,
+      unit: k === 'calories' ? 'kcal' : 'g',
+    };
+  });
+
+  /* ---- workouts ---- */
+  const workoutIds = workouts.map((w) => w.id);
+  let sets = [];
+  if (workoutIds.length) {
+    sets = await db.all(
+      `SELECT s.reps, s.weight, s.set_type, e.name AS exercise, w.date
+       FROM sets s
+       JOIN exercises e ON e.id = s.exercise_id
+       JOIN workouts w ON w.id = e.workout_id
+       WHERE w.id IN (${placeholders(workoutIds)})`, workoutIds);
+  }
+  const workingSets = sets.filter((s) => s.set_type !== 'warmup');
+  const volume = workingSets.reduce((a, s) => a + num(s.reps) * num(s.weight), 0);
+
+  // Muscle split for the week, via the exercise library.
+  let muscles = [];
+  if (workingSets.length) {
+    const names = [...new Set(workingSets.map((s) => s.exercise.toLowerCase()))];
+    const lib = await db.all(
+      `SELECT lower(name) AS lname, muscle FROM exercise_lib WHERE lower(name) IN (${placeholders(names)})`, names);
+    const byName = new Map(lib.map((r) => [r.lname, r.muscle]));
+    const counts = new Map();
+    for (const s of workingSets) {
+      const mus = byName.get(s.exercise.toLowerCase()) || 'other';
+      counts.set(mus, (counts.get(mus) || 0) + 1);
+    }
+    muscles = [...counts.entries()].map(([muscle, setCount]) => ({ muscle, sets: setCount }))
+      .sort((a, b) => b.sets - a.sets);
+  }
+
+  /* ---- personal records ----
+     A PR is a top-set e1RM for an exercise that beats everything logged for it
+     before this week. Comparing against history rather than within the week is
+     what makes it a record instead of just a good day. */
+  const prs = [];
+  if (workingSets.length) {
+    const bestThisWeek = new Map();
+    for (const s of workingSets) {
+      const v = e1rm(num(s.weight), num(s.reps));
+      if (!v) continue;
+      const cur = bestThisWeek.get(s.exercise);
+      if (!cur || v > cur.e1rm) bestThisWeek.set(s.exercise, { e1rm: v, weight: num(s.weight), reps: num(s.reps), date: s.date });
+    }
+    const exNames = [...bestThisWeek.keys()];
+    if (exNames.length) {
+      const priorRows = await db.all(
+        `SELECT e.name AS exercise, s.reps, s.weight
+         FROM sets s
+         JOIN exercises e ON e.id = s.exercise_id
+         JOIN workouts w ON w.id = e.workout_id
+         WHERE w.user_id = ? AND w.date < ? AND s.set_type != 'warmup'
+           AND lower(e.name) IN (${placeholders(exNames.map((n) => n.toLowerCase()))})`,
+        [userId, weekStart, ...exNames.map((n) => n.toLowerCase())]);
+      const priorBest = new Map();
+      for (const r of priorRows) {
+        const v = e1rm(num(r.weight), num(r.reps));
+        const key = r.exercise.toLowerCase();
+        if (!priorBest.has(key) || v > priorBest.get(key)) priorBest.set(key, v);
+      }
+      for (const [exercise, best] of bestThisWeek) {
+        const prev = priorBest.get(exercise.toLowerCase()) || 0;
+        if (best.e1rm > prev + 0.01) {
+          prs.push({
+            exercise, weight: best.weight, reps: best.reps,
+            e1rm: round1s(best.e1rm), prev: round1s(prev),
+            gain: prev ? round1s(best.e1rm - prev) : null,
+            first: !prev,
+          });
+        }
+      }
+      prs.sort((a, b) => (b.gain || 0) - (a.gain || 0));
+    }
+  }
+
+  /* ---- weight ---- */
+  const startKg = prevWeights[0]?.kg ?? weights[0]?.kg ?? null;
+  const endKg = weights.length ? weights[weights.length - 1].kg : null;
+  const weightChange = startKg != null && endKg != null ? round1s(endKg - startKg) : null;
+
+  /* ---- misses ---- */
+  const missedLogging = past.filter((d) => !d.logged).map((d) => d.date);
+  const noActivity = past.filter((d) => !d.trained && !d.rest).map((d) => d.date);
+  const workoutTarget = goals.workouts_per_week || 0;
+  const workoutCount = woDates.size;
+
+  /* ---- streak + previous week comparison ---- */
+  const streakNow = await streak(userId, todayStr);
+  const prev = prevMealDaily[0] || {};
+  const prevDays = num(prev.days);
+  const prevAvgCal = prevDays ? Math.round(num(prev.calories) / prevDays) : null;
+  const prevAvgPro = prevDays ? round1s(num(prev.protein) / prevDays) : null;
+
+  return {
+    userId, name: user?.name || `User ${userId}`,
+    weekStart, weekEnd,
+    daysLogged: nLogged, daysElapsed: past.length,
+    days,
+    goals: {
+      calories: goals.calories, protein: goals.protein, carbs: goals.carbs, fat: goals.fat,
+      workoutsPerWeek: workoutTarget,
+    },
+    macros,
+    totals: {
+      calories: Math.round(past.reduce((a, d) => a + d.calories, 0)),
+      protein: round1s(past.reduce((a, d) => a + d.protein, 0)),
+      carbs: round1s(past.reduce((a, d) => a + d.carbs, 0)),
+      fat: round1s(past.reduce((a, d) => a + d.fat, 0)),
+      meals: past.reduce((a, d) => a + d.meals, 0),
+    },
+    workouts: {
+      count: workoutCount, target: workoutTarget,
+      hitTarget: workoutTarget ? workoutCount >= workoutTarget : null,
+      sets: workingSets.length,
+      volume: Math.round(volume),
+      restDays: restSet.size,
+      muscles,
+      dates: [...woDates].sort(),
+    },
+    prs,
+    weight: { start: startKg, end: endKg, change: weightChange },
+    missed: { logging: missedLogging, activity: noActivity },
+    streak: streakNow,
+    vsLastWeek: { avgCalories: prevAvgCal, avgProtein: prevAvgPro },
+  };
+}
+
+/* Headline sentences. Kept on the server so the push text and the card text are
+   generated from one place and can never disagree. */
+function recapHeadlines(r) {
+  const out = [];
+  const protein = r.macros.find((m) => m.key === 'protein');
+  const cals = r.macros.find((m) => m.key === 'calories');
+
+  if (r.daysLogged === 0) {
+    out.push('No meals logged this week — nothing to measure yet.');
+  } else {
+    if (protein && protein.target) {
+      out.push(protein.diff >= 0
+        ? `Protein averaged ${protein.avg} g — ${protein.diff} g over your ${protein.target} g target.`
+        : `Protein averaged ${protein.avg} g, ${Math.abs(protein.diff)} g short of ${protein.target} g.`);
+    }
+    if (cals && cals.target) {
+      out.push(`Calories averaged ${cals.avg} vs a ${cals.target} target (${cals.diff >= 0 ? '+' : ''}${cals.diff}).`);
+    }
+  }
+  if (r.workouts.target) {
+    out.push(r.workouts.hitTarget
+      ? `${r.workouts.count} of ${r.workouts.target} workouts — target hit.`
+      : `${r.workouts.count} of ${r.workouts.target} workouts.`);
+  } else if (r.workouts.count) {
+    out.push(`${r.workouts.count} workouts logged.`);
+  }
+  if (r.prs.length) {
+    const top = r.prs[0];
+    out.push(r.prs.length === 1
+      ? `New PR: ${top.exercise} ${top.weight} × ${top.reps}.`
+      : `${r.prs.length} new PRs, best on ${top.exercise} (${top.weight} × ${top.reps}).`);
+  }
+  if (r.weight.change != null && Math.abs(r.weight.change) >= 0.1) {
+    out.push(`Weight ${r.weight.change > 0 ? 'up' : 'down'} ${Math.abs(r.weight.change)} kg.`);
+  }
+  if (r.missed.logging.length) {
+    out.push(`${r.missed.logging.length} day${r.missed.logging.length > 1 ? 's' : ''} without a meal logged.`);
+  }
+  return out;
+}
+
+// Generate (or fetch) both users' recaps for a week, storing them once.
+async function getOrBuildRecaps(weekStart, { force = false } = {}) {
+  const users = await db.all('SELECT id FROM users ORDER BY id');
+  const out = [];
+  for (const u of users) {
+    const row = await db.get('SELECT * FROM recaps WHERE user_id = ? AND week_start = ?', [u.id, weekStart]);
+    if (row && !force) { out.push({ ...JSON.parse(row.payload), _stored: true, _pushed: !!row.pushed }); continue; }
+    const r = await buildRecap(u.id, weekStart);
+    r.headlines = recapHeadlines(r);
+    const payload = JSON.stringify(r);
+    if (row) await db.run('UPDATE recaps SET payload = ?, created_at = ? WHERE id = ?', [payload, new Date().toISOString(), row.id]);
+    else await db.run('INSERT INTO recaps (user_id, week_start, payload, created_at) VALUES (?, ?, ?, ?)',
+      [u.id, weekStart, payload, new Date().toISOString()]);
+    out.push({ ...r, _stored: false, _pushed: row ? !!row.pushed : false });
+  }
+  return out;
+}
+
+/* ---- routes ---- */
+
+// The most recently COMPLETED week (Monday of last week).
+const lastCompletedWeek = () => addDays(mondayOf(today()), -7);
+
+route('GET', /^\/api\/recap$/, async (req, res, q) => {
+  const week = isDate(q.get('week')) ? mondayOf(q.get('week')) : lastCompletedWeek();
+  const recaps = await getOrBuildRecaps(week, { force: q.get('force') === '1' });
+  send(res, 200, { weekStart: week, weekEnd: addDays(week, 6), recaps });
+});
+
+// Mark a recap as seen so the card stops taking over the Today tab.
+route('POST', /^\/api\/recap\/seen$/, async (req, res) => {
+  const b = await readBody(req);
+  const week = isDate(b.week) ? b.week : lastCompletedWeek();
+  await db.run('UPDATE recaps SET seen = 1 WHERE user_id = ? AND week_start = ?', [num(b.userId), week]);
+  send(res, 200, { ok: true });
+});
+
+/* Fired by an external scheduler (free GitHub Actions cron). Builds last week's
+   recap and pushes it once. Safe to call repeatedly — pushes are only sent for
+   recaps not already marked pushed, so a retry or a double-fire won't spam. */
+route('POST', /^\/api\/recap\/run$/, async (req, res) => {
+  const b = await readBody(req).catch(() => ({}));
+  const secret = process.env.RECAP_SECRET || '';
+  if (secret && str(b.key) !== secret) return send(res, 403, { error: 'Forbidden' });
+  const week = isDate(b.week) ? mondayOf(b.week) : lastCompletedWeek();
+  const recaps = await getOrBuildRecaps(week, { force: !!b.force });
+  let pushed = 0, delivered = 0;
+  for (const r of recaps) {
+    const row = await db.get('SELECT * FROM recaps WHERE user_id = ? AND week_start = ?', [r.userId, week]);
+    if (!row || (row.pushed && !b.force)) continue;
+    const head = (r.headlines || []).slice(0, 2).join(' ');
+    delivered += await notifyUser(r.userId, {
+      title: `Your week: ${fmtShort(week)}–${fmtShort(addDays(week, 6))}`,
+      body: head || 'Your weekly recap is ready.',
+      tag: `recap-${week}`,
+      url: '/?recap=' + week,
+    });
+    await db.run('UPDATE recaps SET pushed = 1 WHERE id = ?', [row.id]);
+    pushed++;
+  }
+  send(res, 200, { ok: true, weekStart: week, users: recaps.length, pushed, delivered });
+});
+
+const fmtShort = (d) => {
+  const [, m, day] = d.split('-');
+  return `${['', 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][Number(m)]} ${Number(day)}`;
+};
+
 route('GET', /^\/api\/health$/, async (req, res) => send(res, 200, { ok: true, driver: db.driverName, ai: !!process.env.GEMINI_API_KEY }));
 
 /* ---------- server ---------- */

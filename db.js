@@ -177,6 +177,36 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS config (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL)`,
+  // One row per ingredient in a meal. A meal's macro columns stay the source of
+  // truth for every existing query/chart — they're just recomputed as the sum of
+  // these rows when items are present. Meals logged before this feature simply
+  // have no rows here and behave exactly as before.
+  `CREATE TABLE IF NOT EXISTS meal_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    meal_id INTEGER NOT NULL,
+    food_id INTEGER,
+    name TEXT NOT NULL DEFAULT '',
+    grams REAL NOT NULL DEFAULT 0,
+    entered_qty REAL,
+    entered_unit TEXT NOT NULL DEFAULT 'g',
+    state TEXT NOT NULL DEFAULT 'na',
+    calories REAL NOT NULL DEFAULT 0,
+    protein REAL NOT NULL DEFAULT 0,
+    carbs REAL NOT NULL DEFAULT 0,
+    fat REAL NOT NULL DEFAULT 0,
+    source TEXT NOT NULL DEFAULT 'db',
+    sort INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE INDEX IF NOT EXISTS idx_meal_items_meal ON meal_items(meal_id)`,
+  // Generated weekly recaps, keyed by user + week-start (Monday, app timezone).
+  `CREATE TABLE IF NOT EXISTS recaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    week_start TEXT NOT NULL,
+    payload TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT '',
+    pushed INTEGER NOT NULL DEFAULT 0,
+    seen INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(user_id, week_start))`,
   `CREATE TABLE IF NOT EXISTS foods (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
@@ -220,7 +250,65 @@ const MIGRATIONS = [
   `ALTER TABLE meals ADD COLUMN food_id INTEGER`,
   `ALTER TABLE meals ADD COLUMN grams REAL`,
   `ALTER TABLE sets ADD COLUMN set_type TEXT NOT NULL DEFAULT 'normal'`,
+  // --- multi-ingredient meals + cooked/raw awareness (2026-08-18) ---
+  `ALTER TABLE foods ADD COLUMN state TEXT NOT NULL DEFAULT 'na'`,
+  `ALTER TABLE foods ADD COLUMN yield_factor REAL`,
 ];
+
+/* ---- cooked/raw yield factors ----
+   yield_factor = cooked grams produced per 1 g of raw food.
+   Meat loses water when cooked (<1); grains and legumes absorb it (>1).
+   We only tag foods whose stored state we actually know from the name, so we
+   never silently apply a conversion to a food we're guessing about. */
+const YIELD_RULES = [
+  [/\bbacon\b/i, 0.35],
+  [/\bsausage\b/i, 0.75],
+  [/\bspinach\b/i, 0.30],
+  [/\bmushroom/i, 0.70],
+  [/\brice noodles?\b|\bpasta\b|\bnoodle/i, 2.2],
+  [/\brice\b/i, 2.6],
+  [/\boat(s|meal)\b/i, 3.0],
+  [/\bquinoa\b/i, 2.9],
+  [/\bbeans?\b|\blentils?\b|\bchickpeas?\b|\bmonggo\b/i, 2.4],
+  [/\bshrimp\b|\bcrab\b|\bfish\b|\bsalmon\b|\btilapia\b|\btuna\b/i, 0.85],
+  [/\bchicken\b|\bbeef\b|\bpork\b|\bturkey\b|\bsteak\b|\bmeat\b/i, 0.72],
+  [/\begg\b|\begg white\b/i, 0.90],
+  [/\bcabbage\b|\bcauliflower\b|\bcorn\b|\bgreen beans\b|\bokra\b|\bsquash\b|\bkalabasa\b/i, 0.88],
+];
+
+// Green beans / beans ordering matters: "Green beans (sitaw)" is a vegetable, not a legume.
+const VEG_OVERRIDE = /\bgreen beans\b/i;
+
+function stateFromName(name) {
+  if (/\bcooked\b/i.test(name)) return 'cooked';
+  if (/\braw\b|\buncooked\b|\bdry\b/i.test(name)) return 'raw';
+  return 'na';
+}
+
+function yieldFromName(name) {
+  if (VEG_OVERRIDE.test(name)) return 0.88;
+  for (const [re, f] of YIELD_RULES) if (re.test(name)) return f;
+  return null;
+}
+
+// Idempotent: tags every food whose name declares its state. Guarded by a config
+// key so we don't rewrite hundreds of rows on every boot (Turso round trips cost).
+async function backfillFoodStates() {
+  const done = await get(`SELECT value FROM config WHERE key = 'foods_state_v1'`);
+  if (done) return;
+  const foods = await all('SELECT id, name FROM foods');
+  let tagged = 0;
+  for (const f of foods) {
+    const st = stateFromName(f.name);
+    if (st === 'na') continue;
+    const yf = yieldFromName(f.name);
+    if (!yf) continue;
+    await run('UPDATE foods SET state = ?, yield_factor = ? WHERE id = ?', [st, yf, f.id]);
+    tagged++;
+  }
+  await run(`INSERT OR REPLACE INTO config (key, value) VALUES ('foods_state_v1', ?)`, [String(tagged)]);
+  console.log(`Tagged ${tagged} foods with cooked/raw state`);
+}
 
 // Bulk-insert helper: multi-row VALUES in chunks (keeps Turso round trips low)
 async function bulkInsert(table, cols, rows, chunk = 40) {
@@ -258,6 +346,7 @@ async function init() {
   await run(`INSERT OR IGNORE INTO goals (user_id) VALUES (1)`);
   await run(`INSERT OR IGNORE INTO goals (user_id) VALUES (2)`);
   await seedLibraries();
+  await backfillFoodStates();
   console.log(`Storage ready (driver: ${driver.name})`);
 }
 
