@@ -605,6 +605,40 @@ route('DELETE', /^\/api\/user-foods\/(\d+)$/, async (req, res, q, m) => {
    guess is only kept for ingredients we don't have. Real data beats a language
    model's recollection of nutrition labels, and it costs nothing extra. */
 
+/* Gemini's free tier returns 503 UNAVAILABLE ("experiencing high demand") often
+   enough that a single attempt is not good enough — a transient spike would otherwise
+   leave a user's ingredients sitting at 0 kcal with no explanation. Retry the
+   retryable statuses with a short backoff; fail fast on everything else, since a 400
+   or 403 will never succeed on a retry. */
+const RETRYABLE = new Set([429, 500, 502, 503, 504]);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function geminiCall(payload, { tries = 3 } = {}) {
+  const base = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com';
+  const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+  const url = `${base}/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`;
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    if (i) await sleep(700 * i * i); // 0ms, 700ms, 2.8s
+    let r;
+    try {
+      r = await fetch(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
+      });
+    } catch (err) {
+      last = { ok: false, status: 0, body: err.message };
+      continue;
+    }
+    if (r.ok) return { ok: true, json: await r.json() };
+    const body = (await r.text()).slice(0, 300);
+    last = { ok: false, status: r.status, body };
+    if (!RETRYABLE.has(r.status)) break;
+    console.error(`gemini ${r.status}, retrying (${i + 1}/${tries})`);
+  }
+  console.error('gemini failed:', last?.status, last?.body);
+  return last || { ok: false, status: 0, body: 'unknown' };
+}
+
 const AI_SYSTEM = [
   'You are a nutrition estimator for a fitness app.',
   'Break the described or photographed meal into its individual ingredients.',
@@ -681,23 +715,17 @@ route('POST', /^\/api\/ai\/estimate$/, async (req, res) => {
     if (m) parts.push({ inline_data: { mime_type: `image/${m[1] === 'jpg' ? 'jpeg' : m[1]}`, data: m[2] } });
   }
   if (!parts.length) return send(res, 400, { error: 'Describe the meal or attach a photo' });
-  const base = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com';
-  const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-
-  let r;
-  try {
-    r = await fetch(`${base}/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        contents: [{ parts }],
-        systemInstruction: { parts: [{ text: AI_SYSTEM }] },
-        generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
-      }),
-    });
-  } catch { return send(res, 502, { error: 'Could not reach the AI service' }); }
-  if (!r.ok) return send(res, 502, { error: `AI request failed (${r.status})` });
-  const j = await r.json();
+  const call = await geminiCall({
+    contents: [{ parts }],
+    systemInstruction: { parts: [{ text: AI_SYSTEM }] },
+    generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+  });
+  if (!call.ok) {
+    return send(res, 502, { error: call.status === 503
+      ? 'The AI is busy right now — try again in a moment, or type the amounts yourself.'
+      : `AI request failed (${call.status})` });
+  }
+  const j = call.json;
   let out;
   try { out = JSON.parse(j.candidates[0].content.parts[0].text); }
   catch { return send(res, 502, { error: 'AI returned an unexpected format' }); }
@@ -916,30 +944,25 @@ route('POST', /^\/api\/parse-meal$/, async (req, res) => {
 
   /* Anything the database didn't know goes to the AI in ONE batched call —
      not one call per ingredient — and only if a key is configured. */
-  let aiUsed = false;
+  let aiUsed = false, aiError = null;
   if (unresolved.length && process.env.GEMINI_API_KEY && b.useAI !== false) {
     try {
       const list = unresolved.map((u) => `${u.grams} g ${u.name}${u.state !== 'na' ? ` (${u.state})` : ''}`).join('\n');
-      const base = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com';
-      const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
-      const r = await fetch(`${base}/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          contents: [{ parts: [{ text: 'Foods:\n' + list }] }],
-          systemInstruction: { parts: [{ text:
-            'You are a nutrition estimator. For EACH food line given, estimate the macros for exactly the stated weight. ' +
-            'Reply ONLY with JSON: {"items":[{"calories":number,"protein":number,"carbs":number,"fat":number}]} ' +
-            'with one entry per input line, in the same order. Values are grams except calories (kcal).' }] },
-          generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
-        }),
+      const call = await geminiCall({
+        contents: [{ parts: [{ text: 'Foods:\n' + list }] }],
+        systemInstruction: { parts: [{ text:
+          'You are a nutrition estimator. For EACH food line given, estimate the macros for exactly the stated weight. ' +
+          'Reply ONLY with JSON: {"items":[{"calories":number,"protein":number,"carbs":number,"fat":number}]} ' +
+          'with one entry per input line, in the same order. Values are grams except calories (kcal).' }] },
+        generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
       });
-      if (!r.ok) {
+      if (!call.ok) {
         // Never swallow this. A silent skip here looks identical to "the AI had
         // nothing to add", which sent me hunting in the wrong place.
-        console.error('parse-meal AI HTTP', r.status, (await r.text()).slice(0, 300));
+        console.error('parse-meal AI unavailable', call.status, call.body);
+        aiError = call.status === 503 ? 'busy' : 'failed';
       } else {
-        const j = await r.json();
+        const j = call.json;
         const raw = j?.candidates?.[0]?.content?.parts?.[0]?.text;
         if (!raw) console.error('parse-meal AI: no text part', JSON.stringify(j).slice(0, 300));
         const out = raw ? JSON.parse(raw) : {};
@@ -976,7 +999,7 @@ route('POST', /^\/api\/parse-meal$/, async (req, res) => {
     matchedCount: items.filter((i) => i.matched).length,
     aiCount: items.filter((i) => i.source === 'ai').length,
     unknownCount: items.filter((i) => !i.matched && i.source !== 'ai').length,
-    aiUsed,
+    aiUsed, aiError,
     calories: Math.round(sum('calories')), protein: round1s(sum('protein')),
     carbs: round1s(sum('carbs')), fat: round1s(sum('fat')),
   });
