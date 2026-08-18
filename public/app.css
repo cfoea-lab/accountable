@@ -443,3 +443,11 @@ select.plain {
 .rv-head { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.05em; color: var(--ink-55); }
 .rv-head span:not(:first-child) { font-weight: 800; }
 .recap-actions { display: flex; justify-content: flex-end; margin-top: 14px; }
+
+/* ---------------- quick add (type your meal) ---------------- */
+.quick-hint { font-size: 0.72rem; color: var(--ink-55); margin: -2px 0 7px; line-height: 1.4; }
+.f-row textarea.quick-add {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.85rem; line-height: 1.55; min-height: 104px;
+}
+.f-row textarea.quick-add::placeholder { color: var(--ink-35); }

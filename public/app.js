@@ -597,6 +597,10 @@ function mealSheet(existing) {
     });
 
     const name = h('input', { type: 'text', placeholder: 'e.g. Chicken adobo with rice', value: existing?.name || '', autocomplete: 'off' });
+    // Typing the meal is the fast path — one box, one button, done.
+    const quick = h('textarea', { rows: 5, class: 'quick-add', placeholder:
+      'Fried chicken tonkatsu\n400g chicken breast cooked\n50g mayo\n2 tbsp panko' });
+    const quickNote = h('div', { class: 'ai-note', style: 'display:none' });
     const time = h('input', { type: 'time', value: existing?.time || nowTime() });
     const cal = numInput(existing?.calories, 'kcal');
     const pro = numInput(existing?.protein, 'g');
@@ -766,6 +770,45 @@ function mealSheet(existing) {
     const blankItem = () => ({ name: '', foodId: null, food: null, qty: '', unit: 'g', grams: 0, state: 'na', cal: 0, pro: 0, carb: 0, fat: 0, source: 'manual' });
     const addBtn = h('button', { class: 'btn small', type: 'button', onClick: () => addRow(blankItem()) }, '+ Add ingredient');
 
+    /* ---- quick add: free text -> costed ingredient rows ---- */
+    async function runQuickAdd() {
+      const text = quick.value.trim();
+      if (!text) return toast('Type your meal first');
+      quickBtn.disabled = true; quickBtn.textContent = 'Working it out…';
+      try {
+        const r = await api('/api/parse-meal', { method: 'POST', body: { text, name: name.value.trim() } });
+        if (!r.items?.length) { toast('Could not read that — try one ingredient per line'); }
+        else {
+          if (r.name && !name.value.trim()) name.value = r.name;
+          items = r.items.map((i) => ({
+            name: i.name, foodId: i.foodId, food: null,
+            qty: i.grams, unit: 'g', grams: i.grams, state: i.state || 'na',
+            cal: i.calories, pro: i.protein, carb: i.carbs, fat: i.fat,
+            source: i.source,
+          }));
+          // Re-fetch the matched database rows so editing a weight recalculates.
+          await Promise.all(items.map(async (it) => {
+            if (!it.foodId) return;
+            try {
+              const d = await api(`/api/foods?user=${state.me}&q=${encodeURIComponent(it.name)}`);
+              it.food = (d.foods || []).find((f) => f.id === it.foodId) || null;
+            } catch {}
+          }));
+          overrideTotals = false;
+          renderAllRows();
+          quick.value = '';
+          const bits = [`${r.matchedCount} from the food database`];
+          if (r.aiCount) bits.push(`${r.aiCount} estimated by AI`);
+          if (r.unknownCount) bits.push(`${r.unknownCount} needs your numbers`);
+          quickNote.style.display = '';
+          quickNote.textContent = bits.join(' · ') + '. Tap any row to adjust.';
+          setNote('Totals are the sum of your ingredients — tap any number to override.');
+        }
+      } catch (err) { toast(err.message); }
+      quickBtn.disabled = false; quickBtn.textContent = 'Add these ingredients';
+    }
+    const quickBtn = h('button', { class: 'btn primary btn-wide', type: 'button', onClick: runQuickAdd }, 'Add these ingredients');
+
     /* ---- AI breakdown ---- */
     let aiBtn = null;
     if (state.ai) {
@@ -824,7 +867,11 @@ function mealSheet(existing) {
           close(); toast('Meal deleted'); render();
         } }, 'Delete') : null),
       h('div', { class: 'f-row' }, h('label', {}, 'Meal type'), seg),
-      h('div', { class: 'f-row' }, h('label', {}, 'What did you eat?'), name, aiBtn),
+      h('div', { class: 'f-row' }, h('label', {}, 'Meal name'), name),
+      h('div', { class: 'f-row' },
+        h('label', {}, 'Type your meal'),
+        h('div', { class: 'quick-hint' }, 'One ingredient per line, with the amount. Macros fill in automatically.'),
+        quick, quickBtn, quickNote, aiBtn),
       h('div', { class: 'f-row' },
         h('label', {}, 'Ingredients'),
         rowsWrap, totalLine, addBtn),

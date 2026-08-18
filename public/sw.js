@@ -3,7 +3,7 @@
    API calls: network-first with cached fallback, so the dashboard still shows
    the last-known data when offline. Photos: cache-first (they're immutable). */
 'use strict';
-const VERSION = 'accountable-v4';
+const VERSION = 'accountable-v5';
 const SHELL = ['/', '/app.css', '/app.js', '/manifest.webmanifest', '/icons/icon-192.png', '/icons/icon-512.png'];
 
 self.addEventListener('install', (e) => {
