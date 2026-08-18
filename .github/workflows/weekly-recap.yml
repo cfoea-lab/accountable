@@ -1,0 +1,56 @@
+# Weekly recap trigger.
+#
+# Why this exists: Render's free tier puts the service to sleep after 15 idle
+# minutes, so a timer inside the Node process cannot be relied on to fire on a
+# Sunday night. This workflow pings the app from outside, which both wakes the
+# service and triggers recap generation + push.
+#
+# Cost: GitHub Actions is free with unlimited minutes on public repositories.
+#
+# Caveat: GitHub disables scheduled workflows on public repos after 60 days with
+# no repository activity. If that happens the app still shows the recap card —
+# it generates lazily when the app is opened — only the push would be missed.
+# Re-enable it from the Actions tab, or push any commit to reset the clock.
+
+name: Weekly recap
+
+on:
+  schedule:
+    # 01:00 UTC Monday = 21:00 Sunday EDT / 20:00 Sunday EST.
+    # GitHub's scheduler runs in UTC only and has no DST awareness, so the local
+    # send time shifts by an hour between summer and winter. That is fine for a
+    # Sunday-evening digest; do not try to outsmart it with two schedules.
+    - cron: '0 1 * * 1'
+  workflow_dispatch:        # lets you fire it by hand from the Actions tab
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wake the app and generate + push recaps
+        run: |
+          echo "Waking service (free tier cold start can take ~50s)..."
+          for i in 1 2 3 4 5 6; do
+            if curl -sf -m 60 "$APP_URL/api/health" > /dev/null; then
+              echo "Service is awake."
+              break
+            fi
+            echo "  attempt $i failed, retrying in 15s..."
+            sleep 15
+          done
+
+          echo "Triggering recap..."
+          RESPONSE=$(curl -sf -m 120 -X POST "$APP_URL/api/recap/run" \
+            -H 'Content-Type: application/json' \
+            -d "{\"key\":\"$RECAP_SECRET\"}")
+
+          echo "Response: $RESPONSE"
+          echo "$RESPONSE" | grep -q '"ok":true' || {
+            echo "Recap run did not report success."
+            exit 1
+          }
+        env:
+          APP_URL: https://accountable-l1lq.onrender.com
+          # Optional. Only needed if you set RECAP_SECRET in the Render
+          # environment; add a matching repo secret named RECAP_SECRET.
+          RECAP_SECRET: ${{ secrets.RECAP_SECRET }}
