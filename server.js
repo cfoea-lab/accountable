@@ -934,10 +934,24 @@ route('POST', /^\/api\/parse-meal$/, async (req, res) => {
           generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
         }),
       });
-      if (r.ok) {
+      if (!r.ok) {
+        // Never swallow this. A silent skip here looks identical to "the AI had
+        // nothing to add", which sent me hunting in the wrong place.
+        console.error('parse-meal AI HTTP', r.status, (await r.text()).slice(0, 300));
+      } else {
         const j = await r.json();
-        const out = JSON.parse(j.candidates[0].content.parts[0].text);
-        const arr = Array.isArray(out.items) ? out.items : [];
+        const raw = j?.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!raw) console.error('parse-meal AI: no text part', JSON.stringify(j).slice(0, 300));
+        const out = raw ? JSON.parse(raw) : {};
+        // Be liberal about the wrapper key — the model is told "items" but has been
+        // known to answer with a bare array or a differently named field.
+        const arr = Array.isArray(out) ? out
+          : Array.isArray(out.items) ? out.items
+          : Array.isArray(out.ingredients) ? out.ingredients
+          : Array.isArray(out.foods) ? out.foods
+          : Array.isArray(out.results) ? out.results
+          : [];
+        if (!arr.length) console.error('parse-meal AI: unusable shape', JSON.stringify(out).slice(0, 300));
         unresolved.forEach((u, n) => {
           const est = arr[n];
           if (!est) return;
