@@ -632,11 +632,38 @@ async function matchFood(rawName) {
   if (exact) return exact;
   // Prefer a name that starts with the term, then the shortest containing match —
   // "rice" should land on "White rice, cooked", not "Rice cake with peanut butter".
+  /* Ranking matters more than it looks. For "egg", both "Egg, whole, cooked" and
+     "Egg white, cooked" match, and plain length ordering picks the white — the wrong
+     answer. A comma straight after the term marks the base food; another word marks a
+     variant. So: "term," beats "term ", which beats "term…", which beats a mid-string
+     hit, with the shortest name breaking ties. */
+  const rank = `CASE
+      WHEN lower(name) = ?    THEN 0
+      WHEN lower(name) LIKE ? THEN 1
+      WHEN lower(name) LIKE ? THEN 2
+      WHEN lower(name) LIKE ? THEN 3
+      ELSE 4 END`;
+  // Fewer words means a more generic entry: "Egg, whole, cooked" (3) should win over
+  // "Egg, fried in oil" (4), even though the latter is a shorter string.
+  const words = `(length(name) - length(replace(name, ' ', '')))`;
   const hit = await db.get(
-    `SELECT * FROM foods WHERE lower(name) LIKE ?
-     ORDER BY CASE WHEN lower(name) LIKE ? THEN 0 ELSE 1 END, length(name) LIMIT 1`,
-    [`%${name}%`, `${name}%`]);
+    `SELECT * FROM foods WHERE lower(name) LIKE ? ORDER BY ${rank}, ${words}, length(name) LIMIT 1`,
+    [`%${name}%`, name, `${name},%`, `${name} %`, `${name}%`]);
   if (hit) return hit;
+  // People type plurals ("eggs", "strawberries"); the database is singular.
+  // Try the singular form before giving up — this is a spelling variation of the
+  // same word, not a loose semantic guess, so it can't mismatch the way the old
+  // shared-word fallback did.
+  const singular = /ies$/i.test(name) ? name.replace(/ies$/i, 'y')
+    : /(ses|xes|zes|ches|shes)$/i.test(name) ? name.replace(/es$/i, '')
+    : /[^s]s$/i.test(name) ? name.replace(/s$/i, '')
+    : null;
+  if (singular && singular.length > 2) {
+    const alt = await db.get(
+      `SELECT * FROM foods WHERE lower(name) LIKE ? ORDER BY ${rank}, ${words}, length(name) LIMIT 1`,
+      [`%${singular}%`, singular, `${singular},%`, `${singular} %`, `${singular}%`]);
+    if (alt) return alt;
+  }
   // Deliberately no looser fallback than this. An earlier version matched on any
   // shared word, which mapped "unobtainium flakes" onto "Cereal, corn flakes" and
   // silently logged the wrong food. Returning null is better: the ingredient keeps
@@ -715,6 +742,229 @@ route('POST', /^\/api\/ai\/estimate$/, async (req, res) => {
     ingredients,
     matchedCount: ingredients.filter((i) => i.matched).length,
     ...totals,
+  });
+});
+
+/* ---------------- free-text meal parsing ----------------
+   The fastest way to log a meal is to type it the way you'd say it:
+
+       Fried chicken tonkatsu
+       400g chicken breast cooked
+       50g mayo
+       2 tbsp panko
+
+   The first line without a quantity becomes the meal name; every other line is
+   parsed into quantity + unit + food + cooked/raw state, matched against the food
+   database, and costed from real per-100 g data. Only the lines we genuinely
+   cannot match are handed to the AI, so a typical meal costs zero AI calls. */
+
+const UNIT_ALIASES = {
+  g: 'g', gram: 'g', grams: 'g', gr: 'g',
+  kg: 'kg', kilo: 'kg', kilos: 'kg', kilogram: 'kg', kilograms: 'kg',
+  oz: 'oz', ounce: 'oz', ounces: 'oz',
+  lb: 'lb', lbs: 'lb', pound: 'lb', pounds: 'lb',
+  ml: 'ml', milliliter: 'ml', millilitre: 'ml', milliliters: 'ml', millilitres: 'ml',
+  l: 'l', liter: 'l', litre: 'l', liters: 'l', litres: 'l',
+  cup: 'cup', cups: 'cup',
+  tbsp: 'tbsp', tablespoon: 'tbsp', tablespoons: 'tbsp', tbs: 'tbsp',
+  tsp: 'tsp', teaspoon: 'tsp', teaspoons: 'tsp',
+  piece: 'piece', pieces: 'piece', pc: 'piece', pcs: 'piece',
+  slice: 'slice', slices: 'slice',
+  scoop: 'scoop', scoops: 'scoop',
+  serving: 'serving', servings: 'serving', portion: 'serving', portions: 'serving',
+};
+
+// Weight/volume units we can convert without knowing the food.
+const ABSOLUTE_GRAMS = { g: 1, kg: 1000, oz: 28.35, lb: 453.6, ml: 1, l: 1000 };
+// Household measures — rough, and only used when the food has no portion of its own.
+const HOUSEHOLD_GRAMS = { cup: 240, tbsp: 15, tsp: 5, piece: 100, slice: 30, scoop: 30, serving: 100 };
+
+const UNIT_WORDS = Object.keys(UNIT_ALIASES).sort((a, b) => b.length - a.length).join('|');
+// "400g chicken breast", "2 tbsp mayo", "1.5 cups rice"
+const LEADING_QTY = new RegExp(`^(\\d+(?:[.,]\\d+)?)\\s*(${UNIT_WORDS})?\\b\\.?\\s*(?:of\\s+)?(.+)$`, 'i');
+// "chicken breast 400g", "mayo 50 g", and bare "chicken breast 250" (grams implied).
+// The name must end in a letter or bracket and be followed by real whitespace, so
+// ratio-style names keep working: in "Ground beef 80/20" the trailing 20 is preceded
+// by "/" rather than a space, so it is not mistaken for a quantity.
+const TRAILING_QTY = new RegExp(`^(.+?[a-z%)\\]])\\s+(\\d+(?:[.,]\\d+)?)\\s*(${UNIT_WORDS})?\\s*\\.?$`, 'i');
+const STATE_RE = /\b(cooked|uncooked|raw|dry|dried)\b/i;
+// Noise people naturally type that isn't part of a food name.
+const STRIP_RE = /^(?:\s*[-*•·]\s*|\s*\d+[.)]\s*)/;
+
+function parseLine(line) {
+  let text = line.replace(STRIP_RE, '').trim();
+  if (!text) return null;
+
+  let qty = null, unit = null, name = text;
+
+  let m = LEADING_QTY.exec(text);
+  if (m) {
+    qty = parseFloat(m[1].replace(',', '.'));
+    unit = m[2] ? UNIT_ALIASES[m[2].toLowerCase()] : null;
+    name = m[3];
+  } else {
+    m = TRAILING_QTY.exec(text);
+    if (m) {
+      name = m[1];
+      qty = parseFloat(m[2].replace(',', '.'));
+      unit = m[3] ? UNIT_ALIASES[m[3].toLowerCase()] : null;
+    }
+  }
+
+  // Cooked/raw can appear anywhere in the line; pull it out of the food name.
+  let state = 'na';
+  const sm = STATE_RE.exec(name);
+  if (sm) {
+    const word = sm[1].toLowerCase();
+    state = (word === 'cooked') ? 'cooked' : 'raw';
+    name = (name.slice(0, sm.index) + ' ' + name.slice(sm.index + sm[1].length)).trim();
+  }
+
+  name = name.replace(/[,;]+$/, '').replace(/\s{2,}/g, ' ').trim();
+  if (!name) return null;
+  return { qty, unit, name, state, raw: line.trim() };
+}
+
+// Turn a parsed quantity into grams of the matched food.
+function toGrams(parsed, food) {
+  const { qty, unit } = parsed;
+  if (qty == null) {
+    // No quantity given — fall back to the food's own portion, else 100 g,
+    // and flag it so the UI can say the amount was assumed.
+    return { grams: (food && food.portion_grams) || 100, assumed: true };
+  }
+  if (!unit) {
+    /* A bare number is usually grams ("chicken breast 250"), but "3 eggs" means
+       three of them, not three grams. Small counts against a food that has a known
+       portion weight are read as counts; anything above the threshold, or a food we
+       have no portion for, stays grams. Nobody eats 3 g of a whole food, and nobody
+       counts out 250 of one, so the two cases don't overlap in practice. */
+    const COUNT_MAX = 20;
+    if (qty <= COUNT_MAX && food && food.portion_grams) {
+      const per = food.portion_grams / (parseFloat((food.portion_name || '')) || 1);
+      return { grams: qty * per, assumed: false, readAsCount: true };
+    }
+    return { grams: qty, assumed: false };
+  }
+  if (ABSOLUTE_GRAMS[unit]) return { grams: qty * ABSOLUTE_GRAMS[unit], assumed: false };
+
+  // Household measure: prefer the food's own portion, since "1 cup rice" is 158 g of
+  // cooked rice rather than a generic 240 g, and an egg is ~50 g rather than 100 g.
+  // portion_name usually leads with a count ("6 pieces", "1 large"), so divide the
+  // portion weight by that count to get the weight of a single unit.
+  const COUNTABLE = new Set(['piece', 'slice', 'scoop', 'serving']);
+  if (food && food.portion_grams) {
+    const pn = (food.portion_name || '').toLowerCase();
+    if (pn.includes(unit) || COUNTABLE.has(unit)) {
+      const per = food.portion_grams / (parseFloat(pn) || 1);
+      return { grams: qty * per, assumed: false };
+    }
+  }
+  return { grams: qty * (HOUSEHOLD_GRAMS[unit] || 100), assumed: !food };
+}
+
+route('POST', /^\/api\/parse-meal$/, async (req, res) => {
+  const b = await readBody(req);
+  const text = str(b.text, '');
+  if (!text.trim()) return send(res, 400, { error: 'Type your meal first' });
+
+  const lines = text.split('\n').map((l) => l.trim()).filter(Boolean).slice(0, 40);
+  if (!lines.length) return send(res, 400, { error: 'Type your meal first' });
+
+  let mealName = str(b.name, '').trim();
+  const parsed = [];
+  for (let i = 0; i < lines.length; i++) {
+    const p = parseLine(lines[i]);
+    if (!p) continue;
+    // A first line with no quantity is the meal's name, not an ingredient.
+    if (i === 0 && p.qty == null && lines.length > 1 && !mealName) {
+      mealName = p.name;
+      continue;
+    }
+    parsed.push(p);
+  }
+
+  const items = [];
+  const unresolved = [];
+  for (const p of parsed) {
+    const food = await matchFood(p.name);
+    if (food) {
+      const { grams, assumed } = toGrams(p, food);
+      // If the line didn't say cooked/raw, use the food's own state so we don't
+      // apply a conversion the user never asked for.
+      const state = p.state !== 'na' ? p.state : (food.state !== 'na' ? food.state : 'na');
+      const k = convertGrams(grams, state, food) / 100;
+      items.push({
+        name: food.name, foodId: food.id, grams: Math.round(grams),
+        state, source: 'db', matched: true, assumedAmount: assumed,
+        calories: Math.round(food.kcal * k), protein: round1s(food.protein * k),
+        carbs: round1s(food.carbs * k), fat: round1s(food.fat * k),
+        foodState: food.state, yieldFactor: food.yield_factor,
+        typed: p.raw,
+      });
+    } else {
+      const { grams } = toGrams(p, null);
+      const row = {
+        name: p.name, foodId: null, grams: Math.round(grams), state: p.state,
+        source: 'manual', matched: false, assumedAmount: p.qty == null,
+        calories: 0, protein: 0, carbs: 0, fat: 0, typed: p.raw,
+      };
+      items.push(row);
+      unresolved.push({ index: items.length - 1, name: p.name, grams: row.grams, state: p.state });
+    }
+  }
+
+  /* Anything the database didn't know goes to the AI in ONE batched call —
+     not one call per ingredient — and only if a key is configured. */
+  let aiUsed = false;
+  if (unresolved.length && process.env.GEMINI_API_KEY && b.useAI !== false) {
+    try {
+      const list = unresolved.map((u) => `${u.grams} g ${u.name}${u.state !== 'na' ? ` (${u.state})` : ''}`).join('\n');
+      const base = process.env.GEMINI_URL || 'https://generativelanguage.googleapis.com';
+      const model = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+      const r = await fetch(`${base}/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: 'Foods:\n' + list }] }],
+          systemInstruction: { parts: [{ text:
+            'You are a nutrition estimator. For EACH food line given, estimate the macros for exactly the stated weight. ' +
+            'Reply ONLY with JSON: {"items":[{"calories":number,"protein":number,"carbs":number,"fat":number}]} ' +
+            'with one entry per input line, in the same order. Values are grams except calories (kcal).' }] },
+          generationConfig: { responseMimeType: 'application/json', temperature: 0.2 },
+        }),
+      });
+      if (r.ok) {
+        const j = await r.json();
+        const out = JSON.parse(j.candidates[0].content.parts[0].text);
+        const arr = Array.isArray(out.items) ? out.items : [];
+        unresolved.forEach((u, n) => {
+          const est = arr[n];
+          if (!est) return;
+          const it = items[u.index];
+          it.calories = Math.round(num(est.calories));
+          it.protein = round1s(est.protein);
+          it.carbs = round1s(est.carbs);
+          it.fat = round1s(est.fat);
+          it.source = 'ai';
+          aiUsed = true;
+        });
+      }
+    } catch (err) {
+      console.error('parse-meal AI step failed:', err.message);
+    }
+  }
+
+  const sum = (k) => items.reduce((a, i) => a + num(i[k]), 0);
+  send(res, 200, {
+    name: mealName,
+    items,
+    matchedCount: items.filter((i) => i.matched).length,
+    aiCount: items.filter((i) => i.source === 'ai').length,
+    unknownCount: items.filter((i) => !i.matched && i.source !== 'ai').length,
+    aiUsed,
+    calories: Math.round(sum('calories')), protein: round1s(sum('protein')),
+    carbs: round1s(sum('carbs')), fat: round1s(sum('fat')),
   });
 });
 
