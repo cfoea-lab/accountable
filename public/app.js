@@ -35,22 +35,28 @@ async function api(path, opts = {}) {
 }
 
 const pad = (n) => String(n).padStart(2, '0');
-const todayStr = () => {
-  const d = new Date();
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-};
-const nowTime = () => {
-  const d = new Date();
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
-};
+// Canonical app timezone — matches the server so a day means the same thing on
+// every device. America/New_York tracks the EST/EDT switch automatically.
+const APP_TZ = 'America/New_York';
+const _tzDate = new Intl.DateTimeFormat('en-CA', { timeZone: APP_TZ, year: 'numeric', month: '2-digit', day: '2-digit' });
+const _tzTime = new Intl.DateTimeFormat('en-GB', { timeZone: APP_TZ, hour: '2-digit', minute: '2-digit', hour12: false });
+const _tzHour = new Intl.DateTimeFormat('en-GB', { timeZone: APP_TZ, hour: '2-digit', hour12: false });
+const todayStr = () => _tzDate.format(new Date());
+const nowTime = () => _tzTime.format(new Date());
+const nowHour = () => Number(_tzHour.format(new Date()));
+// Date strings are anchored at UTC noon so day arithmetic never slips across a
+// boundary, and labels render the date itself rather than shifting per device.
 function addDays(dateStr, n) {
-  const d = new Date(dateStr + 'T12:00:00');
-  d.setDate(d.getDate() + n);
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+  const d = new Date(dateStr + 'T12:00:00Z');
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
 }
 function fmtDate(dateStr, opts = { weekday: 'long', month: 'short', day: 'numeric' }) {
-  return new Date(dateStr + 'T12:00:00').toLocaleDateString(undefined, opts);
+  return new Date(dateStr + 'T12:00:00Z').toLocaleDateString(undefined, { ...opts, timeZone: 'UTC' });
 }
+// 0 = Monday … 6 = Sunday
+const dowIdx = (dateStr) => (new Date(dateStr + 'T12:00:00Z').getUTCDay() + 6) % 7;
+const mondayOf = (dateStr) => addDays(dateStr, -dowIdx(dateStr));
 const round1 = (n) => Math.round(n * 10) / 10;
 
 /* ---------------- state ---------------- */
@@ -224,6 +230,135 @@ function meter(value, goal, over = value > goal) {
 }
 
 /* ---------------- TODAY ---------------- */
+/* ---------------- weekly recap card ----------------
+   Shown on the Today tab at the start of a new week, for the week that just
+   finished. Dismissing marks it seen so it stops taking over the tab, but it
+   stays reachable from Progress. */
+
+async function recapCard() {
+  let data;
+  try { data = await api('/api/recap'); } catch { return null; }
+  if (!data?.recaps?.length) return null;
+
+  const mine = data.recaps.find((r) => r.userId === state.me);
+  const theirs = data.recaps.find((r) => r.userId !== state.me);
+  if (!mine) return null;
+
+  // Nothing logged at all that week by either person — don't nag with an empty card.
+  if (!mine.daysLogged && !mine.workouts.count && (!theirs || (!theirs.daysLogged && !theirs.workouts.count))) return null;
+  if (localStorage.getItem('acc.recapSeen') === data.weekStart) return null;
+
+  const card = h('div', { class: 'card recap-card' });
+
+  card.append(h('div', { class: 'card-head' },
+    h('h2', {}, 'Last week'),
+    h('span', { class: 'sub' }, `${fmtDate(data.weekStart, { month: 'short', day: 'numeric' })} – ${fmtDate(data.weekEnd, { month: 'short', day: 'numeric' })}`),
+  ));
+
+  // Headlines — the same sentences the push notification uses.
+  if (mine.headlines?.length) {
+    card.append(h('ul', { class: 'recap-heads' }, mine.headlines.map((t) => h('li', {}, t))));
+  }
+
+  /* Macros vs target, as label / bar / value rows. The bar is capped at 100% so
+     a big overshoot doesn't blow out the layout, but the number still tells the
+     truth. */
+  const macroWrap = h('div', { class: 'recap-bars' });
+  macroWrap.append(h('div', { class: 'recap-label' }, 'Daily average vs target'));
+  for (const m of mine.macros) {
+    const pct = Math.max(0, Math.min(100, m.pct));
+    const over = m.diff >= 0;
+    macroWrap.append(h('div', { class: 'rb-row' },
+      h('span', { class: 'rb-name' }, m.label),
+      h('span', { class: 'rb-track' }, h('span', { class: 'rb-fill', style: `width:${pct}%` })),
+      h('span', { class: 'rb-val' }, `${m.avg}`,
+        h('i', { class: over ? 'rb-over' : 'rb-under' }, ` ${over ? '+' : ''}${m.diff}`)),
+    ));
+  }
+  card.append(macroWrap);
+
+  if (mine.daysLogged < mine.daysElapsed) {
+    const missed = mine.daysElapsed - mine.daysLogged;
+    card.append(h('div', { class: 'recap-note' },
+      `Averaged over the ${mine.daysLogged} day${mine.daysLogged === 1 ? '' : 's'} you logged. ${missed} day${missed === 1 ? '' : 's'} untracked.`));
+  }
+
+  // Training summary
+  const w = mine.workouts;
+  card.append(h('div', { class: 'recap-stats' },
+    statChip(`${w.count}${w.target ? `/${w.target}` : ''}`, 'workouts'),
+    statChip(String(w.sets), 'working sets'),
+    statChip(`${(w.volume / 1000).toFixed(1)}t`, 'volume'),
+    statChip(String(mine.streak), 'day streak'),
+    mine.weight.change != null ? statChip(`${mine.weight.change > 0 ? '+' : ''}${mine.weight.change}`, 'kg') : null,
+  ));
+
+  if (w.muscles?.length) {
+    card.append(h('div', { class: 'recap-label' }, 'Muscle focus'));
+    const top = w.muscles.slice(0, 6);
+    const max = Math.max(...top.map((x) => x.sets), 1);
+    const mw = h('div', { class: 'recap-bars' });
+    for (const mu of top) {
+      mw.append(h('div', { class: 'rb-row' },
+        h('span', { class: 'rb-name' }, mu.muscle),
+        h('span', { class: 'rb-track' }, h('span', { class: 'rb-fill', style: `width:${(mu.sets / max) * 100}%` })),
+        h('span', { class: 'rb-val' }, `${mu.sets}`),
+      ));
+    }
+    card.append(mw);
+  }
+
+  // Milestones
+  if (mine.prs?.length) {
+    card.append(h('div', { class: 'recap-label' }, `New PR${mine.prs.length > 1 ? 's' : ''}`));
+    card.append(h('div', { class: 'recap-prs' }, mine.prs.slice(0, 5).map((p) =>
+      h('div', { class: 'recap-pr' },
+        h('b', {}, p.exercise),
+        h('span', {}, ` ${p.weight} × ${p.reps}`),
+        h('i', {}, p.first ? ' first logged' : ` +${p.gain} e1RM`)))));
+  }
+
+  // What was missed
+  const missedBits = [];
+  if (mine.missed.logging.length) missedBits.push(`${mine.missed.logging.length} day${mine.missed.logging.length > 1 ? 's' : ''} with no meal logged`);
+  if (mine.missed.activity.length) missedBits.push(`${mine.missed.activity.length} day${mine.missed.activity.length > 1 ? 's' : ''} with no workout or rest day`);
+  if (missedBits.length) {
+    card.append(h('div', { class: 'recap-label' }, 'Missed'),
+      h('div', { class: 'recap-note' }, missedBits.join(' · ')));
+  }
+
+  // Head to head — the whole point of a two-person app.
+  if (theirs) {
+    card.append(h('div', { class: 'recap-label' }, `${mine.name} vs ${theirs.name}`));
+    const rows = [
+      ['Days logged', `${mine.daysLogged}/${mine.daysElapsed}`, `${theirs.daysLogged}/${theirs.daysElapsed}`],
+      ['Avg calories', mine.macros[0].avg, theirs.macros[0].avg],
+      ['Avg protein', `${mine.macros[1].avg} g`, `${theirs.macros[1].avg} g`],
+      ['Workouts', mine.workouts.count, theirs.workouts.count],
+      ['Streak', mine.streak, theirs.streak],
+      ['PRs', mine.prs.length, theirs.prs.length],
+    ];
+    const table = h('div', { class: 'recap-vs' },
+      h('div', { class: 'rv-row rv-head' }, h('span', {}, ''), h('span', {}, mine.name), h('span', {}, theirs.name)),
+      rows.map(([label, a, b]) => h('div', { class: 'rv-row' }, h('span', {}, label), h('span', {}, String(a)), h('span', {}, String(b)))),
+    );
+    card.append(table);
+  }
+
+  card.append(h('div', { class: 'recap-actions' },
+    h('button', { class: 'btn small', onClick: async () => {
+      localStorage.setItem('acc.recapSeen', data.weekStart);
+      try { await api('/api/recap/seen', { method: 'POST', body: { userId: state.me, week: data.weekStart } }); } catch {}
+      render();
+    } }, 'Got it'),
+  ));
+
+  return card;
+}
+
+const statChip = (value, label) => h('div', { class: 'stat-chip' },
+  h('b', {}, value), h('span', {}, label));
+
 async function renderToday(main) {
   const data = await api(`/api/summary?date=${state.date}`);
   const meU = data.users.find((u) => u.userId === state.me);
@@ -255,6 +390,11 @@ async function renderToday(main) {
       h('button', { class: 'btn small ghost', onClick: () => { localStorage.setItem('acc.pushDismissed', '1'); render(); } }, 'Later'),
     ));
   }
+
+  // Weekly recap for the week that just finished (generated lazily if the
+  // scheduled ping never fired — see /api/recap).
+  const rc = await recapCard();
+  if (rc) main.append(rc);
 
   const grid = h('div', { class: 'grid2' });
   grid.append(personCard(meU, true), personCard(partnerU, false));
@@ -412,11 +552,38 @@ function weightSheet(current) {
 }
 
 /* ---------------- meal sheet (search-first, MyFitnessPal-style) ---------------- */
+/* ---------------- meal sheet (ingredient based) ----------------
+   A meal is a list of ingredients. Each row carries its own food, weight and
+   cooked/raw state, and computes its own macros; the meal total is the sum.
+   Everything stays editable: pick from the database, let the AI break down a
+   photo, or just type numbers in by hand as before. */
+
+// Mirror of the server's conversion. A food row stores macros per 100 g in one
+// state; yield_factor is cooked grams per raw gram (under 1 for meat, which loses
+// water; over 1 for grains, which absorb it). If the user weighed the food in the
+// other state, move their grams onto the food's scale first.
+function convertGrams(grams, enteredState, food) {
+  const g = Number(grams) || 0;
+  if (!food || !food.yield_factor || food.state === 'na') return g;
+  if (!['raw', 'cooked'].includes(enteredState) || enteredState === food.state) return g;
+  return food.state === 'raw' ? g / food.yield_factor : g * food.yield_factor;
+}
+
+const canToggleState = (food) => !!(food && food.yield_factor && food.state !== 'na');
+
 function mealSheet(existing) {
   const isEdit = !!existing;
   let type = existing?.type || suggestMealType();
-  let selFood = null; // selected database food (per-100g values) → grams math applies
-  let selFoodId = existing?.food_id || null;
+  // Working copy of the ingredient rows.
+  let items = (existing?.items || []).map((it) => ({
+    name: it.name, foodId: it.food_id, food: null,
+    qty: it.entered_qty != null ? it.entered_qty : it.grams,
+    unit: it.entered_unit || 'g',
+    grams: it.grams, state: it.state || 'na',
+    cal: it.calories, pro: it.protein, carb: it.carbs, fat: it.fat,
+    source: it.source || 'manual',
+  }));
+  let overrideTotals = false; // set when the user hand-edits a total
 
   openSheet((sheet, close) => {
     const seg = h('div', { class: 'seg' });
@@ -429,7 +596,7 @@ function mealSheet(existing) {
       seg.append(b);
     });
 
-    const name = h('input', { type: 'text', placeholder: 'Search food, or type anything…', value: existing?.name || '', autocomplete: 'off' });
+    const name = h('input', { type: 'text', placeholder: 'e.g. Chicken adobo with rice', value: existing?.name || '', autocomplete: 'off' });
     const time = h('input', { type: 'time', value: existing?.time || nowTime() });
     const cal = numInput(existing?.calories, 'kcal');
     const pro = numInput(existing?.protein, 'g');
@@ -437,113 +604,217 @@ function mealSheet(existing) {
     const fat = numInput(existing?.fat, 'g');
     const notes = h('textarea', { rows: 2, placeholder: 'Notes (optional)' }, existing?.notes || '');
     const photo = photoField(existing?.photo);
-    const results = h('div', { class: 'fs-results', style: 'display:none' });
     const note = h('div', { class: 'ai-note', style: 'display:none' });
-
-    // grams row (shows when a database food is picked)
-    const grams = h('input', { type: 'number', min: '1', inputmode: 'numeric', value: existing?.grams || '', onInput: () => recalc() });
-    const gramsHint = h('span', { class: 'ai-note', style: 'margin-top:0' });
-    const gramsRow = h('div', { class: 'grams-row', style: 'display:none' }, grams, h('span', { style: 'font-weight:700;font-size:0.85rem' }, 'g'), gramsHint);
+    const rowsWrap = h('div', { class: 'ing-list' });
+    const totalLine = h('div', { class: 'ing-total' });
 
     function setNote(text) { note.style.display = ''; note.textContent = text; }
-    function recalc() {
-      if (!selFood) return;
-      const k = (Number(grams.value) || 0) / 100;
-      cal.value = Math.round(selFood.kcal * k);
-      pro.value = round1(selFood.protein * k);
-      carb.value = round1(selFood.carbs * k);
-      fat.value = round1(selFood.fat * k);
-      setNote('Auto-calculated — tap any number to adjust it.');
-    }
-    function pickDb(f) {
-      selFood = f; selFoodId = f.id;
-      name.value = f.name;
-      results.style.display = 'none';
-      gramsRow.style.display = '';
-      if (!Number(grams.value)) grams.value = f.portion_grams || 100;
-      gramsHint.textContent = f.portion_name && f.portion_grams ? `${f.portion_name} ≈ ${f.portion_grams} g` : 'per 100 g in database';
-      recalc();
-    }
-    function fillDirect(nm, c, p, cb, f, tagText) {
-      selFood = null; selFoodId = null;
-      name.value = nm; cal.value = c; pro.value = round1(p); carb.value = round1(cb); fat.value = round1(f);
-      results.style.display = 'none'; gramsRow.style.display = 'none';
-      setNote(tagText);
-    }
 
-    const rowEl = (label, tag, fn, extra) => h('div', { class: 'fs-row', onClick: fn }, h('span', {}, label), h('span', { class: 'fs-tag' }, tag), extra);
-    const headEl = (t) => h('div', { class: 'fs-row', style: 'cursor:default;font-size:0.68rem;font-weight:800;text-transform:uppercase;letter-spacing:0.05em;color:var(--ink-55);padding:7px 12px' }, t);
+    /* ---- totals ---- */
+    function recomputeTotals() {
+      if (!items.length) { totalLine.textContent = ''; return; }
+      const sum = (k) => items.reduce((a, i) => a + (Number(i[k]) || 0), 0);
+      const t = {
+        cal: Math.round(sum('cal')), pro: round1(sum('pro')),
+        carb: round1(sum('carb')), fat: round1(sum('fat')),
+      };
+      if (!overrideTotals) {
+        cal.value = t.cal; pro.value = t.pro; carb.value = t.carb; fat.value = t.fat;
+      }
+      totalLine.textContent = `${items.length} ingredient${items.length > 1 ? 's' : ''} · ${t.cal} kcal · ${t.pro}P / ${t.carb}C / ${t.fat}F`;
+      if (!overrideTotals) setNote('Totals are the sum of your ingredients — tap any number to override.');
+    }
+    [cal, pro, carb, fat].forEach((inp) => inp.addEventListener('input', () => {
+      if (items.length) { overrideTotals = true; setNote('Manual total — your ingredient rows are kept but no longer added up.'); }
+    }));
 
-    let searchTimer = null;
-    async function doSearch() {
-      const q = name.value.trim();
-      let data;
-      try { data = await api(`/api/foods?user=${state.me}&q=${encodeURIComponent(q)}`); } catch { return; }
-      if (name.value.trim() !== q) return; // stale response
-      results.innerHTML = '';
-      let any = false;
-      if (!q) {
-        if (data.myFoods?.length) {
-          results.append(headEl('My foods'));
-          data.myFoods.forEach((f) => {
-            results.append(rowEl(f.name, `${f.kcal} kcal`, () => fillDirect(f.name, f.kcal, f.protein, f.carbs, f.fat, 'From My Foods — edit anything.'),
-              h('button', { class: 'x', type: 'button', 'aria-label': 'Remove from My Foods', html: '&#10005;', style: 'color:var(--ink-35);padding:0 2px', onClick: async (e) => {
-                e.stopPropagation();
-                await api(`/api/user-foods/${f.id}`, { method: 'DELETE' }); doSearch();
-              } })));
-            any = true;
-          });
+    /* ---- one ingredient row ---- */
+    function makeRow(item) {
+      const row = h('div', { class: 'ing-row' });
+      const q = h('input', { class: 'ing-qty', type: 'number', min: '0', step: 'any', inputmode: 'decimal', value: item.qty ?? '' });
+      const unitSel = h('select', { class: 'ing-unit' });
+      const stateSel = h('select', { class: 'ing-state' },
+        h('option', { value: 'na' }, 'as eaten'),
+        h('option', { value: 'raw' }, 'raw'),
+        h('option', { value: 'cooked' }, 'cooked'));
+      const kcalTag = h('span', { class: 'ing-kcal' });
+      const searchInput = h('input', { class: 'ing-name', type: 'text', placeholder: 'Search a food…', value: item.name || '', autocomplete: 'off' });
+      const results = h('div', { class: 'fs-results', style: 'display:none' });
+      const hint = h('div', { class: 'ing-hint' });
+
+      function fillUnits() {
+        unitSel.innerHTML = '';
+        unitSel.append(h('option', { value: 'g' }, 'g'));
+        const f = item.food;
+        if (f && f.portion_name && f.portion_grams) {
+          unitSel.append(h('option', { value: 'portion' }, f.portion_name));
         }
-        if (data.recents?.length) {
-          results.append(headEl('Recent'));
-          data.recents.forEach((r) => {
-            results.append(rowEl(r.name, `${r.calories} kcal`, () => fillDirect(r.name, r.calories, r.protein, r.carbs, r.fat, 'Copied from your last log — edit anything.')));
-            any = true;
-          });
+        unitSel.value = item.unit === 'portion' && f && f.portion_grams ? 'portion' : 'g';
+      }
+
+      function refreshHint() {
+        const f = item.food;
+        const showState = canToggleState(f);
+        stateSel.style.display = showState ? '' : 'none';
+        if (!showState) { hint.textContent = item.source === 'ai' ? 'AI estimate — editable' : ''; return; }
+        const stored = f.state === 'raw' ? 'raw' : 'cooked';
+        const other = stored === 'raw' ? 'cooked' : 'raw';
+        hint.textContent = item.state !== 'na' && item.state !== stored
+          ? `Database value is ${stored}; converting your ${other} weight.`
+          : `Database value is ${stored} weight.`;
+      }
+
+      function recalcRow() {
+        const f = item.food;
+        item.qty = Number(q.value) || 0;
+        item.unit = unitSel.value;
+        item.state = stateSel.value;
+        // Convert the entered quantity into grams of the food as stored.
+        let grams = item.qty;
+        if (item.unit === 'portion' && f && f.portion_grams) grams = item.qty * f.portion_grams;
+        item.grams = grams;
+        if (f) {
+          const k = convertGrams(grams, item.state, f) / 100;
+          item.cal = Math.round(f.kcal * k);
+          item.pro = round1(f.protein * k);
+          item.carb = round1(f.carbs * k);
+          item.fat = round1(f.fat * k);
         }
-      } else {
+        kcalTag.textContent = item.cal ? `${item.cal} kcal` : '';
+        refreshHint();
+        recomputeTotals();
+      }
+
+      q.addEventListener('input', recalcRow);
+      unitSel.addEventListener('change', recalcRow);
+      stateSel.addEventListener('change', recalcRow);
+
+      /* row food search */
+      let timer = null;
+      async function doSearch() {
+        const term = searchInput.value.trim();
+        if (!term) { results.style.display = 'none'; return; }
+        let data;
+        try { data = await api(`/api/foods?user=${state.me}&q=${encodeURIComponent(term)}`); } catch { return; }
+        if (searchInput.value.trim() !== term) return; // stale
+        results.innerHTML = '';
+        let any = false;
         (data.mine || []).forEach((f) => {
-          results.append(rowEl(f.name, `My food · ${f.kcal} kcal`, () => fillDirect(f.name, f.kcal, f.protein, f.carbs, f.fat, 'From My Foods — edit anything.')));
+          results.append(h('div', { class: 'fs-row', onClick: () => {
+            item.food = null; item.foodId = null; item.name = f.name; item.source = 'mine';
+            item.cal = f.kcal; item.pro = f.protein; item.carb = f.carbs; item.fat = f.fat;
+            searchInput.value = f.name; results.style.display = 'none';
+            fillUnits(); kcalTag.textContent = `${item.cal} kcal`; refreshHint(); recomputeTotals();
+          } }, h('span', {}, f.name), h('span', { class: 'fs-tag' }, `My food · ${f.kcal} kcal`)));
           any = true;
         });
         (data.foods || []).forEach((f) => {
-          results.append(rowEl(f.name, `${f.kcal} kcal / 100 g`, () => pickDb(f)));
+          const tag = f.state !== 'na' ? `${f.kcal} kcal/100 g · ${f.state}` : `${f.kcal} kcal/100 g`;
+          results.append(h('div', { class: 'fs-row', onClick: () => {
+            item.food = f; item.foodId = f.id; item.name = f.name; item.source = 'db';
+            searchInput.value = f.name;
+            results.style.display = 'none';
+            if (!Number(q.value)) q.value = f.portion_grams || 100;
+            item.state = canToggleState(f) ? f.state : 'na';
+            fillUnits();
+            stateSel.value = item.state;
+            recalcRow();
+          } }, h('span', {}, f.name), h('span', { class: 'fs-tag' }, tag)));
           any = true;
         });
+        results.style.display = any ? '' : 'none';
       }
-      results.style.display = any ? '' : 'none';
-    }
-    name.addEventListener('input', () => {
-      selFood = null; selFoodId = null; gramsRow.style.display = 'none';
-      clearTimeout(searchTimer); searchTimer = setTimeout(doSearch, 220);
-    });
-    name.addEventListener('focus', doSearch);
-    sheet.addEventListener('pointerdown', (e) => {
-      if (!results.contains(e.target) && e.target !== name) results.style.display = 'none';
-    });
+      searchInput.addEventListener('input', () => {
+        item.name = searchInput.value;
+        item.food = null; item.foodId = null; item.source = 'manual';
+        clearTimeout(timer); timer = setTimeout(doSearch, 220);
+      });
+      sheet.addEventListener('pointerdown', (e) => {
+        if (!results.contains(e.target) && e.target !== searchInput) results.style.display = 'none';
+      });
 
-    // AI estimate (only shown when the server has a key configured)
+      const del = h('button', { class: 'x ing-del', type: 'button', 'aria-label': 'Remove ingredient', html: '&#10005;', onClick: () => {
+        items = items.filter((i) => i !== item);
+        row.remove(); recomputeTotals();
+      } });
+
+      fillUnits();
+      stateSel.value = item.state || 'na';
+      kcalTag.textContent = item.cal ? `${item.cal} kcal` : '';
+      refreshHint();
+
+      row.append(
+        h('div', { class: 'ing-top' }, searchInput, del),
+        results,
+        h('div', { class: 'ing-bottom' }, q, unitSel, stateSel, kcalTag),
+        hint,
+      );
+      return row;
+    }
+
+    function addRow(item) {
+      items.push(item);
+      rowsWrap.append(makeRow(item));
+      recomputeTotals();
+    }
+    function renderAllRows() {
+      rowsWrap.innerHTML = '';
+      items.forEach((it) => rowsWrap.append(makeRow(it)));
+      recomputeTotals();
+    }
+
+    const blankItem = () => ({ name: '', foodId: null, food: null, qty: '', unit: 'g', grams: 0, state: 'na', cal: 0, pro: 0, carb: 0, fat: 0, source: 'manual' });
+    const addBtn = h('button', { class: 'btn small', type: 'button', onClick: () => addRow(blankItem()) }, '+ Add ingredient');
+
+    /* ---- AI breakdown ---- */
     let aiBtn = null;
     if (state.ai) {
       aiBtn = h('button', { class: 'btn btn-wide', type: 'button', style: 'margin-top:8px', onClick: async () => {
         const text = name.value.trim();
         const pd = photo.getData() || null;
-        if (!text && !pd) return toast('Type what you ate or add a photo first');
-        aiBtn.disabled = true; aiBtn.textContent = 'Estimating…';
+        if (!text && !pd) return toast('Describe the meal or add a photo first');
+        aiBtn.disabled = true; aiBtn.textContent = 'Reading your meal…';
         try {
           const r = await api('/api/ai/estimate', { method: 'POST', body: { text, photoData: pd } });
-          selFood = null; selFoodId = null; gramsRow.style.display = 'none'; results.style.display = 'none';
           if (!text && r.name) name.value = r.name;
-          cal.value = r.calories; pro.value = r.protein; carb.value = r.carbs; fat.value = r.fat;
-          setNote(`~AI estimate (${r.confidence} confidence). Estimates vary — tweak any number if it looks off.`);
+          if (r.ingredients?.length) {
+            // Replace rows with the breakdown. Rows matched to our own database are
+            // recomputed from real data; the rest keep the model's estimate.
+            items = r.ingredients.map((i) => ({
+              name: i.name, foodId: i.foodId, food: null,
+              qty: i.grams, unit: 'g', grams: i.grams, state: i.state || 'na',
+              cal: i.calories, pro: i.protein, carb: i.carbs, fat: i.fat,
+              source: i.source,
+            }));
+            // Re-fetch the matched food rows so editing a weight recomputes correctly.
+            await Promise.all(items.map(async (it) => {
+              if (!it.foodId) return;
+              try {
+                const d = await api(`/api/foods?user=${state.me}&q=${encodeURIComponent(it.name)}`);
+                it.food = (d.foods || []).find((f) => f.id === it.foodId) || null;
+              } catch {}
+            }));
+            overrideTotals = false;
+            renderAllRows();
+            setNote(`~AI breakdown (${r.confidence} confidence) · ${r.matchedCount} of ${r.ingredients.length} matched to the food database. Every row is editable.`);
+          } else {
+            overrideTotals = true;
+            cal.value = r.calories; pro.value = r.protein; carb.value = r.carbs; fat.value = r.fat;
+            setNote(`~AI estimate (${r.confidence} confidence) — tweak any number if it looks off.`);
+          }
         } catch (err) { toast(err.message); }
-        aiBtn.disabled = false; aiBtn.textContent = '✨ Estimate with AI';
-      } }, '✨ Estimate with AI');
+        aiBtn.disabled = false; aiBtn.textContent = '✨ Break down with AI';
+      } }, '✨ Break down with AI');
     }
 
     const saveMine = h('input', { type: 'checkbox', style: 'width:auto;accent-color:var(--accent)' });
-    const saveMineRow = h('label', { style: 'display:flex;gap:8px;align-items:center;cursor:pointer;font-size:0.8rem;color:var(--ink-70);margin-top:10px' },
+    const saveMineRow = h('label', { style: 'display:flex;gap:8px;align-items:center;cursor:pointer;font-size:0.8rem;color:var(--ink-70);margin-top:10px;text-transform:none;letter-spacing:0;font-weight:500' },
       saveMine, 'Save to My Foods so it’s one tap next time');
+
+    // Existing meals that predate ingredients open with their totals intact and no
+    // rows — nothing about them changes unless the user adds ingredients.
+    renderAllRows();
+    if (isEdit && !items.length) overrideTotals = true;
 
     sheet.append(
       h('h3', {}, isEdit ? 'Edit meal' : 'Log meal',
@@ -553,7 +824,10 @@ function mealSheet(existing) {
           close(); toast('Meal deleted'); render();
         } }, 'Delete') : null),
       h('div', { class: 'f-row' }, h('label', {}, 'Meal type'), seg),
-      h('div', { class: 'f-row' }, h('label', {}, 'What did you eat?'), name, results, gramsRow, aiBtn),
+      h('div', { class: 'f-row' }, h('label', {}, 'What did you eat?'), name, aiBtn),
+      h('div', { class: 'f-row' },
+        h('label', {}, 'Ingredients'),
+        rowsWrap, totalLine, addBtn),
       h('div', { class: 'f-row' }, h('label', {}, 'Calories & macros'),
         h('div', { class: 'f-grid-4' },
           labeled(cal, 'kcal'), labeled(pro, 'Protein'), labeled(carb, 'Carbs'), labeled(fat, 'Fat'),
@@ -566,19 +840,26 @@ function mealSheet(existing) {
       h('div', { class: 'form-actions' },
         h('button', { class: 'btn ghost', onClick: close }, 'Cancel'),
         h('button', { class: 'btn primary', onClick: async () => {
+          const clean = items.filter((i) => (i.name || '').trim() || Number(i.cal));
           const body = {
             userId: state.me, date: existing?.date || state.date, time: time.value, type,
             name: name.value.trim(), calories: Number(cal.value) || 0, protein: Number(pro.value) || 0,
             carbs: Number(carb.value) || 0, fat: Number(fat.value) || 0, notes: notes.value.trim(),
-            foodId: selFoodId, grams: selFood ? Number(grams.value) || null : (Number(grams.value) || null),
+            overrideTotals,
+            items: clean.map((i) => ({
+              name: i.name, foodId: i.foodId, grams: i.grams,
+              enteredQty: i.qty === '' ? null : Number(i.qty), enteredUnit: i.unit, state: i.state,
+              calories: i.cal, protein: i.pro, carbs: i.carb, fat: i.fat, source: i.source,
+            })),
           };
+          if (!body.name && clean.length) body.name = clean.map((i) => i.name).filter(Boolean).slice(0, 3).join(', ');
           if (photo.getData()) body.photoData = photo.getData();
           if (photo.removed()) body.removePhoto = true;
           if (saveMine.checked && body.name && body.calories) {
             try {
               await api('/api/user-foods', { method: 'POST', body: {
                 userId: state.me, name: body.name, kcal: body.calories, protein: body.protein,
-                carbs: body.carbs, fat: body.fat, portionGrams: body.grams,
+                carbs: body.carbs, fat: body.fat, portionGrams: null,
               } });
             } catch {}
           }
@@ -590,10 +871,11 @@ function mealSheet(existing) {
     );
   });
 }
+
 const numInput = (val, ph) => h('input', { type: 'number', min: '0', inputmode: 'numeric', placeholder: ph, value: val ?? '' });
 const labeled = (input, lab) => h('div', {}, h('div', { style: 'font-size:0.66rem;font-weight:700;color:var(--ink-55);margin-bottom:3px;text-align:center' }, lab), input);
 function suggestMealType() {
-  const hr = new Date().getHours();
+  const hr = nowHour();
   if (hr < 10.5) return 'breakfast';
   if (hr < 15) return 'lunch';
   if (hr < 20.5) return 'dinner';
@@ -976,9 +1258,7 @@ async function renderTrain(main) {
 }
 
 function countThisWeek(workouts) {
-  const now = new Date();
-  const day = (now.getDay() + 6) % 7; // Monday = 0
-  const monday = addDays(todayStr(), -day);
+  const monday = mondayOf(todayStr());
   return workouts.filter((w) => w.date >= monday && w.date <= todayStr()).length;
 }
 
