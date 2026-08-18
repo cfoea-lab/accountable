@@ -799,7 +799,11 @@ function mealSheet(existing) {
           quick.value = '';
           const bits = [`${r.matchedCount} from the food database`];
           if (r.aiCount) bits.push(`${r.aiCount} estimated by AI`);
-          if (r.unknownCount) bits.push(`${r.unknownCount} needs your numbers`);
+          if (r.unknownCount) {
+            bits.push(r.aiError === 'busy'
+              ? `${r.unknownCount} left blank — the AI is busy, tap “Break down with AI” to retry`
+              : `${r.unknownCount} needs your numbers`);
+          }
           quickNote.style.display = '';
           quickNote.textContent = bits.join(' · ') + '. Tap any row to adjust.';
           setNote('Totals are the sum of your ingredients — tap any number to override.');
